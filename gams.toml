@@ -1,0 +1,39 @@
+# Governed Agent Memory Server (GAMS) Configuration
+# All fields can be overridden by environment variables with the GAMS_ prefix.
+# Example: GAMS_DATA_PATH="./custom.db", GAMS_SERVER_HTTP_PORT=9090
+
+[data]
+# Path to the SQLite database file
+path = "gams.db"
+
+[server]
+# Port for MCP HTTP/SSE transport, agent REST API, and admin REST API
+http_port = 8080
+
+# Admin API credential for tenant and key administration
+# Warning: If left empty, a warning will be logged and admin endpoints will be insecure in dev.
+admin_key = ""
+
+# Allowed CORS origins for browser-based callers
+cors_origins = ["*"]
+
+[mcp]
+# MCP transport to run: "http" | "stdio" | "both"
+transport = "http"
+
+[limits]
+# Maximum allowed size for a single claim's content in bytes
+max_claim_size_bytes = 65536
+
+# Maximum number of evidence items attached to a single claim version
+max_evidence_per_claim = 20
+
+# Default limit for recall queries if omitted by the caller
+default_recall_limit = 10
+
+[auth]
+# Whether HMAC-SHA256 request signing is enforced
+signing_required = false
+
+# TTL in seconds for the in-memory bcrypt key verification cache
+key_cache_ttl_seconds = 300
