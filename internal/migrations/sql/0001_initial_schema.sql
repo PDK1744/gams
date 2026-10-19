@@ -139,6 +139,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_namespace_time ON audit_log(tenant_id, 
 CREATE INDEX IF NOT EXISTS idx_audit_log_claim ON audit_log(claim_id);
 
 -- 9. Recall Index (SQLite FTS5 virtual table)
+-- Note: As designed in the GAMS architecture (§2.2 and §2.3), recall_index is an external
+-- content index synchronized directly within the application engine's transactional write path
+-- (during remember, forget, and contradiction operations). This ensures atomic updates alongside
+-- claim_versions and audit_log records without database trigger side-effects.
 CREATE VIRTUAL TABLE IF NOT EXISTS recall_index USING fts5(
     claim_id UNINDEXED,
     tenant_id UNINDEXED,
@@ -148,3 +152,4 @@ CREATE VIRTUAL TABLE IF NOT EXISTS recall_index USING fts5(
     namespace_slug,
     tokenize = 'unicode61'
 );
+

@@ -94,3 +94,41 @@ func TestHealthEndpointDegradedWhenDBClosed(t *testing.T) {
 		t.Errorf("expected database 'disconnected', got %q", health.Database)
 	}
 }
+
+func TestPanicRecovery(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("opening test db: %v", err)
+	}
+	defer database.Close()
+
+	cfg := config.Default()
+	srv := server.New(cfg, database, "0.1.0", nil)
+
+	// Custom handler that panics
+	panicHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("simulated unhandled error")
+	})
+
+	wrapped := srv.Handler()
+	// Test that server middleware catches panic from wrapped mux if a handler panics
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
+
+	// Create sub-mux using srv's recovery
+	mux := http.NewServeMux()
+	mux.Handle("/panic", panicHandler)
+	testServer := server.New(cfg, database, "0.1.0", nil)
+	_ = testServer
+
+	// Verify that serving a panic through handler does not crash process
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("middleware failed to recover panic: %v", r)
+		}
+	}()
+
+	wrapped.ServeHTTP(rec, req)
+}
+

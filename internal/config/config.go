@@ -24,6 +24,7 @@ type DataConfig struct {
 }
 
 type ServerConfig struct {
+	Host        string   `toml:"host"`
 	HTTPPort    int      `toml:"http_port"`
 	AdminKey    string   `toml:"admin_key"`
 	CORSOrigins []string `toml:"cors_origins"`
@@ -51,9 +52,10 @@ func Default() *Config {
 			Path: "gams.db",
 		},
 		Server: ServerConfig{
+			Host:        "127.0.0.1",
 			HTTPPort:    8080,
 			AdminKey:    "",
-			CORSOrigins: []string{"*"},
+			CORSOrigins: []string{}, // Secure by default: no cross-origin requests permitted unless configured
 		},
 		MCP: MCPConfig{
 			Transport: "http",
@@ -89,7 +91,9 @@ func Load(configPath string) (*Config, error) {
 		}
 	}
 
-	applyEnvOverrides(cfg)
+	if err := applyEnvOverrides(cfg); err != nil {
+		return nil, fmt.Errorf("applying environment variable overrides: %w", err)
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
@@ -98,48 +102,77 @@ func Load(configPath string) (*Config, error) {
 	return cfg, nil
 }
 
-func applyEnvOverrides(cfg *Config) {
+func applyEnvOverrides(cfg *Config) error {
 	if val := os.Getenv("GAMS_DATA_PATH"); val != "" {
 		cfg.Data.Path = val
 	}
+	if val := os.Getenv("GAMS_SERVER_HOST"); val != "" {
+		cfg.Server.Host = val
+	}
 	if val := os.Getenv("GAMS_SERVER_HTTP_PORT"); val != "" {
-		if port, err := strconv.Atoi(val); err == nil {
-			cfg.Server.HTTPPort = port
+		port, err := strconv.Atoi(val)
+		if err != nil {
+			return fmt.Errorf("invalid GAMS_SERVER_HTTP_PORT %q: must be integer", val)
 		}
+		cfg.Server.HTTPPort = port
 	}
 	if val := os.Getenv("GAMS_SERVER_ADMIN_KEY"); val != "" {
 		cfg.Server.AdminKey = val
 	}
 	if val := os.Getenv("GAMS_SERVER_CORS_ORIGINS"); val != "" {
-		cfg.Server.CORSOrigins = strings.Split(val, ",")
+		origins := strings.Split(val, ",")
+		var cleaned []string
+		for _, o := range origins {
+			if trimmed := strings.TrimSpace(o); trimmed != "" {
+				cleaned = append(cleaned, trimmed)
+			}
+		}
+		cfg.Server.CORSOrigins = cleaned
 	}
 	if val := os.Getenv("GAMS_MCP_TRANSPORT"); val != "" {
 		cfg.MCP.Transport = val
 	}
 	if val := os.Getenv("GAMS_LIMITS_MAX_CLAIM_SIZE_BYTES"); val != "" {
-		if size, err := strconv.Atoi(val); err == nil {
-			cfg.Limits.MaxClaimSizeBytes = size
+		size, err := strconv.Atoi(val)
+		if err != nil {
+			return fmt.Errorf("invalid GAMS_LIMITS_MAX_CLAIM_SIZE_BYTES %q: must be integer", val)
 		}
+		cfg.Limits.MaxClaimSizeBytes = size
 	}
 	if val := os.Getenv("GAMS_LIMITS_MAX_EVIDENCE_PER_CLAIM"); val != "" {
-		if count, err := strconv.Atoi(val); err == nil {
-			cfg.Limits.MaxEvidencePerClaim = count
+		count, err := strconv.Atoi(val)
+		if err != nil {
+			return fmt.Errorf("invalid GAMS_LIMITS_MAX_EVIDENCE_PER_CLAIM %q: must be integer", val)
 		}
+		cfg.Limits.MaxEvidencePerClaim = count
 	}
 	if val := os.Getenv("GAMS_LIMITS_DEFAULT_RECALL_LIMIT"); val != "" {
-		if limit, err := strconv.Atoi(val); err == nil {
-			cfg.Limits.DefaultRecallLimit = limit
+		limit, err := strconv.Atoi(val)
+		if err != nil {
+			return fmt.Errorf("invalid GAMS_LIMITS_DEFAULT_RECALL_LIMIT %q: must be integer", val)
 		}
+		cfg.Limits.DefaultRecallLimit = limit
 	}
 	if val := os.Getenv("GAMS_AUTH_SIGNING_REQUIRED"); val != "" {
-		cfg.Auth.SigningRequired = strings.EqualFold(val, "true") || val == "1"
-	}
-	if val := os.Getenv("GAMS_AUTH_KEY_CACHE_TTL_SECONDS"); val != "" {
-		if ttl, err := strconv.Atoi(val); err == nil {
-			cfg.Auth.KeyCacheTTLSeconds = ttl
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "true", "1", "yes":
+			cfg.Auth.SigningRequired = true
+		case "false", "0", "no":
+			cfg.Auth.SigningRequired = false
+		default:
+			return fmt.Errorf("invalid GAMS_AUTH_SIGNING_REQUIRED %q: must be boolean", val)
 		}
 	}
+	if val := os.Getenv("GAMS_AUTH_KEY_CACHE_TTL_SECONDS"); val != "" {
+		ttl, err := strconv.Atoi(val)
+		if err != nil {
+			return fmt.Errorf("invalid GAMS_AUTH_KEY_CACHE_TTL_SECONDS %q: must be integer", val)
+		}
+		cfg.Auth.KeyCacheTTLSeconds = ttl
+	}
+	return nil
 }
+
 
 // Validate checks whether the configuration values are within acceptable bounds.
 func (c *Config) Validate() error {

@@ -52,25 +52,35 @@ func Run(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("reading migration versions: %w", err)
 	}
 
-	// 3. Find and sort embedded migration files
+	// 3. Find, validate, and sort embedded migration files
 	entries, err := fs.ReadDir(migrationFS, "sql")
 	if err != nil {
 		return fmt.Errorf("reading embedded migrations dir: %w", err)
 	}
 
 	var files []migrationFile
+	seenVersions := make(map[int]string)
+
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+		if entry.IsDir() {
 			continue
+		}
+		if !strings.HasSuffix(entry.Name(), ".sql") {
+			return fmt.Errorf("unexpected non-sql file in migrations directory: %q", entry.Name())
 		}
 		parts := strings.SplitN(entry.Name(), "_", 2)
-		if len(parts) < 2 {
-			continue
+		if len(parts) < 2 || parts[1] == "" {
+			return fmt.Errorf("invalid migration filename %q: expected format {version}_{description}.sql", entry.Name())
 		}
 		version, err := strconv.Atoi(parts[0])
-		if err != nil {
-			return fmt.Errorf("invalid migration version prefix in %q: %w", entry.Name(), err)
+		if err != nil || version <= 0 {
+			return fmt.Errorf("invalid migration version prefix in %q: must be a positive integer", entry.Name())
 		}
+		if prevFile, exists := seenVersions[version]; exists {
+			return fmt.Errorf("duplicate migration version %d found in %q and %q", version, prevFile, entry.Name())
+		}
+		seenVersions[version] = entry.Name()
+
 		files = append(files, migrationFile{
 			version: version,
 			name:    entry.Name(),

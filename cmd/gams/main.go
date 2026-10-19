@@ -48,6 +48,7 @@ func run(args []string) error {
 
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	configPath := fs.String("config", "gams.toml", "path to configuration file")
+	devMode := fs.Bool("dev", false, "run in development mode (permits empty admin key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -57,8 +58,13 @@ func run(args []string) error {
 		return fmt.Errorf("loading configuration: %w", err)
 	}
 
+	isDev := *devMode || os.Getenv("GAMS_DEV") == "true" || os.Getenv("GAMS_ENV") == "development"
 	if cfg.Server.AdminKey == "" {
-		logger.Warn("server.admin_key is not set; running with insecure admin credentials (acceptable for dev)")
+		if isDev {
+			logger.Warn("running in development mode with empty server.admin_key; administrative endpoints are unauthenticated")
+		} else {
+			logger.Warn("server.admin_key is not set; running with empty admin key. For production, set an admin key or use --dev for local testing")
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -76,9 +82,9 @@ func run(args []string) error {
 
 	srv := server.New(cfg, database, Version, logger)
 
-	// Listen for OS shutdown signals
+	// Listen for OS shutdown signals (os.Interrupt covers SIGINT on Unix/Windows)
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	errChan := make(chan error, 1)
 	go func() {
@@ -118,5 +124,7 @@ Commands:
 
 Options for 'serve':
   --config    Path to TOML configuration file (default: gams.toml)
+  --dev       Enable development mode (permits unauthenticated admin endpoints)
 `)
 }
+

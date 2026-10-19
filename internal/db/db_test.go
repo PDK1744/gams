@@ -28,13 +28,23 @@ func TestOpenAndPragmas(t *testing.T) {
 		t.Errorf("expected journal_mode 'wal', got %q", journalMode)
 	}
 
-	// Verify Foreign Keys
-	var foreignKeys int
-	if err := database.QueryRowContext(ctx, "PRAGMA foreign_keys;").Scan(&foreignKeys); err != nil {
-		t.Fatalf("querying foreign_keys: %v", err)
-	}
-	if foreignKeys != 1 {
-		t.Errorf("expected foreign_keys 1, got %d", foreignKeys)
+	// Verify that multiple pooled connections retain foreign_keys and busy_timeout
+	for i := 0; i < 5; i++ {
+		var foreignKeys int
+		var busyTimeout int
+		if err := database.QueryRowContext(ctx, "PRAGMA foreign_keys;").Scan(&foreignKeys); err != nil {
+			t.Fatalf("querying foreign_keys: %v", err)
+		}
+		if foreignKeys != 1 {
+			t.Errorf("conn %d: expected foreign_keys 1, got %d", i, foreignKeys)
+		}
+
+		if err := database.QueryRowContext(ctx, "PRAGMA busy_timeout;").Scan(&busyTimeout); err != nil {
+			t.Fatalf("querying busy_timeout: %v", err)
+		}
+		if busyTimeout != 5000 {
+			t.Errorf("conn %d: expected busy_timeout 5000, got %d", i, busyTimeout)
+		}
 	}
 
 	// Test FTS5 insertion and querying
@@ -53,3 +63,21 @@ func TestOpenAndPragmas(t *testing.T) {
 		t.Errorf("expected claim_id 'c1', got %q", matchClaimID)
 	}
 }
+
+func TestOpenAbsolutePathCreatesDirectory(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	// Create a nested path where parent directory does not exist yet
+	absPath := filepath.Join(tempDir, "nested", "sub", "test.db")
+
+	database, err := db.Open(ctx, absPath)
+	if err != nil {
+		t.Fatalf("db.Open with nested absolute path failed: %v", err)
+	}
+	defer database.Close()
+
+	if err := database.PingContext(ctx); err != nil {
+		t.Errorf("ping failed on newly created absolute path db: %v", err)
+	}
+}
+

@@ -7,6 +7,9 @@
 path = "gams.db"
 
 [server]
+# Bind host (default: 127.0.0.1 for local isolation; set to 0.0.0.0 for containerized environments)
+host = "127.0.0.1"
+
 # Port for MCP HTTP/SSE transport, agent REST API, and admin REST API
 http_port = 8080
 
@@ -14,8 +17,9 @@ http_port = 8080
 # Warning: If left empty, a warning will be logged and admin endpoints will be insecure in dev.
 admin_key = ""
 
-# Allowed CORS origins for browser-based callers
-cors_origins = ["*"]
+# Allowed CORS origins for browser-based callers (empty by default for security)
+# Example for dev: cors_origins = ["http://localhost:3000"]
+cors_origins = []
 
 [mcp]
 # MCP transport to run: "http" | "stdio" | "both"

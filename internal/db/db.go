@@ -7,42 +7,52 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/PDK1744/gams/internal/migrations"
 	_ "modernc.org/sqlite"
 )
 
+
 // DB wraps a standard sql.DB pool configured specifically for SQLite WAL operation.
 type DB struct {
 	*sql.DB
 }
 
-// Open initializes the SQLite database connection, sets recommended WAL pragmas,
+// Open initializes the SQLite database connection, configures DSN connection-level pragmas
+// (ensuring all pooled connections have WAL, busy_timeout, foreign_keys enabled),
 // configures the connection pool, and runs all pending schema migrations.
 func Open(ctx context.Context, dbPath string) (*DB, error) {
 	if dbPath == "" {
 		return nil, fmt.Errorf("database path cannot be empty")
 	}
 
-	// If not an in-memory database, ensure parent directory exists
-	if dbPath != ":memory:" && !filepath.IsAbs(dbPath) {
-		dir := filepath.Dir(dbPath)
+	// If not an in-memory database, ensure parent directory exists (supporting both relative and absolute paths)
+	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file::memory:") {
+		cleanPath := strings.TrimPrefix(dbPath, "file:")
+		if idx := strings.Index(cleanPath, "?"); idx != -1 {
+			cleanPath = cleanPath[:idx]
+		}
+		dir := filepath.Dir(cleanPath)
 		if dir != "." && dir != "" {
-			if err := os.MkdirAll(dir, 0755); err != nil {
+			if err := os.MkdirAll(dir, 0750); err != nil {
 				return nil, fmt.Errorf("creating database directory %q: %w", dir, err)
 			}
 		}
 	}
 
+	// Build DSN with connection-level pragmas so EVERY connection in the pool inherits them
+	dsn := buildDSN(dbPath)
+
 	// Open database handle with modernc.org/sqlite driver
-	conn, err := sql.Open("sqlite", dbPath)
+	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("opening sqlite database at %q: %w", dbPath, err)
+		return nil, fmt.Errorf("opening sqlite database with DSN %q: %w", dsn, err)
 	}
 
-	// Configure pool
-	if dbPath == ":memory:" {
+	// Configure connection pool
+	if dbPath == ":memory:" || strings.Contains(dbPath, ":memory:") {
 		conn.SetMaxOpenConns(1)
 	} else {
 		maxConns := runtime.NumCPU() * 2
@@ -52,21 +62,6 @@ func Open(ctx context.Context, dbPath string) (*DB, error) {
 		conn.SetMaxOpenConns(maxConns)
 		conn.SetMaxIdleConns(maxConns)
 		conn.SetConnMaxLifetime(1 * time.Hour)
-	}
-
-	// Apply WAL pragmas and foreign keys
-	pragmas := []string{
-		"PRAGMA journal_mode = WAL;",
-		"PRAGMA busy_timeout = 5000;",
-		"PRAGMA synchronous = NORMAL;",
-		"PRAGMA foreign_keys = ON;",
-	}
-
-	for _, pragma := range pragmas {
-		if _, err := conn.ExecContext(ctx, pragma); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("executing pragma %q: %w", pragma, err)
-		}
 	}
 
 	// Verify connectivity
@@ -83,3 +78,20 @@ func Open(ctx context.Context, dbPath string) (*DB, error) {
 
 	return &DB{DB: conn}, nil
 }
+
+// buildDSN appends essential SQLite pragmas to the connection string.
+// Applying these as DSN parameters ensures every connection created by the pool
+// receives foreign_keys, busy_timeout, and WAL mode.
+func buildDSN(dbPath string) string {
+	pragmas := "_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)"
+	if dbPath != ":memory:" && !strings.Contains(dbPath, ":memory:") {
+		pragmas += "&_pragma=journal_mode(WAL)"
+	}
+
+	separator := "?"
+	if strings.Contains(dbPath, "?") {
+		separator = "&"
+	}
+	return dbPath + separator + pragmas
+}
+

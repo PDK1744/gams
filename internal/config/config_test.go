@@ -14,8 +14,14 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Data.Path != "gams.db" {
 		t.Errorf("expected data.path 'gams.db', got %q", cfg.Data.Path)
 	}
+	if cfg.Server.Host != "127.0.0.1" {
+		t.Errorf("expected server.host '127.0.0.1', got %q", cfg.Server.Host)
+	}
 	if cfg.Server.HTTPPort != 8080 {
 		t.Errorf("expected server.http_port 8080, got %d", cfg.Server.HTTPPort)
+	}
+	if len(cfg.Server.CORSOrigins) != 0 {
+		t.Errorf("expected empty server.cors_origins by default, got %v", cfg.Server.CORSOrigins)
 	}
 	if cfg.MCP.Transport != "http" {
 		t.Errorf("expected mcp.transport 'http', got %q", cfg.MCP.Transport)
@@ -37,6 +43,7 @@ func TestLoadWithFile(t *testing.T) {
 path = "custom_test.db"
 
 [server]
+host = "0.0.0.0"
 http_port = 9090
 admin_key = "secret123"
 cors_origins = ["http://localhost:3000"]
@@ -65,11 +72,17 @@ key_cache_ttl_seconds = 600
 	if cfg.Data.Path != "custom_test.db" {
 		t.Errorf("expected path 'custom_test.db', got %q", cfg.Data.Path)
 	}
+	if cfg.Server.Host != "0.0.0.0" {
+		t.Errorf("expected host '0.0.0.0', got %q", cfg.Server.Host)
+	}
 	if cfg.Server.HTTPPort != 9090 {
 		t.Errorf("expected port 9090, got %d", cfg.Server.HTTPPort)
 	}
 	if cfg.Server.AdminKey != "secret123" {
 		t.Errorf("expected admin key 'secret123', got %q", cfg.Server.AdminKey)
+	}
+	if len(cfg.Server.CORSOrigins) != 1 || cfg.Server.CORSOrigins[0] != "http://localhost:3000" {
+		t.Errorf("expected cors_origins ['http://localhost:3000'], got %v", cfg.Server.CORSOrigins)
 	}
 	if cfg.MCP.Transport != "both" {
 		t.Errorf("expected transport 'both', got %q", cfg.MCP.Transport)
@@ -81,6 +94,7 @@ key_cache_ttl_seconds = 600
 
 func TestEnvOverrides(t *testing.T) {
 	t.Setenv("GAMS_DATA_PATH", "env_override.db")
+	t.Setenv("GAMS_SERVER_HOST", "0.0.0.0")
 	t.Setenv("GAMS_SERVER_HTTP_PORT", "7070")
 	t.Setenv("GAMS_MCP_TRANSPORT", "stdio")
 	t.Setenv("GAMS_AUTH_SIGNING_REQUIRED", "true")
@@ -93,6 +107,9 @@ func TestEnvOverrides(t *testing.T) {
 	if cfg.Data.Path != "env_override.db" {
 		t.Errorf("expected data.path 'env_override.db', got %q", cfg.Data.Path)
 	}
+	if cfg.Server.Host != "0.0.0.0" {
+		t.Errorf("expected server.host '0.0.0.0', got %q", cfg.Server.Host)
+	}
 	if cfg.Server.HTTPPort != 7070 {
 		t.Errorf("expected port 7070, got %d", cfg.Server.HTTPPort)
 	}
@@ -103,6 +120,25 @@ func TestEnvOverrides(t *testing.T) {
 		t.Errorf("expected auth signing true")
 	}
 }
+
+func TestEnvOverrideErrors(t *testing.T) {
+	t.Run("invalid port", func(t *testing.T) {
+		t.Setenv("GAMS_SERVER_HTTP_PORT", "invalid_number")
+		_, err := config.Load("")
+		if err == nil {
+			t.Errorf("expected error for invalid GAMS_SERVER_HTTP_PORT, got nil")
+		}
+	})
+
+	t.Run("invalid boolean", func(t *testing.T) {
+		t.Setenv("GAMS_AUTH_SIGNING_REQUIRED", "not_a_bool")
+		_, err := config.Load("")
+		if err == nil {
+			t.Errorf("expected error for invalid GAMS_AUTH_SIGNING_REQUIRED, got nil")
+		}
+	})
+}
+
 
 func TestValidationErrors(t *testing.T) {
 	tests := []struct {
