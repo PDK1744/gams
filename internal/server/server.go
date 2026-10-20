@@ -15,6 +15,8 @@ import (
 	"github.com/PDK1744/gams/internal/config"
 	"github.com/PDK1744/gams/internal/db"
 	"github.com/PDK1744/gams/internal/engine"
+	"github.com/PDK1744/gams/internal/mcp"
+	httptransport "github.com/PDK1744/gams/internal/transport/http"
 )
 
 // Server encapsulates the HTTP server for GAMS.
@@ -25,6 +27,7 @@ type Server struct {
 	httpServer *http.Server
 	logger     *slog.Logger
 	engine     *engine.Engine
+	sessionMgr *httptransport.SessionManager
 	devMode    bool
 }
 
@@ -82,6 +85,13 @@ func New(cfg *config.Config, database *db.DB, version string, logger *slog.Logge
 	adminHandler.RegisterRoutes(mux)
 	apiHandler.RegisterRoutes(mux)
 
+	if cfg.MCP.Transport == "" || cfg.MCP.Transport == "http" || cfg.MCP.Transport == "both" {
+		mcpDispatcher := mcp.NewDispatcher(eng, version)
+		s.sessionMgr = httptransport.NewSessionManager(30 * time.Minute)
+		mcpHandler := httptransport.NewHandler(eng, mcpDispatcher, s.sessionMgr, authSvc, s.logger)
+		mcpHandler.RegisterRoutes(mux)
+	}
+
 	s.httpServer = &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.HTTPPort),
 		Handler:           s.wrapMiddleware(mux),
@@ -121,7 +131,8 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 					w.Header().Set("Access-Control-Allow-Origin", "*")
 				}
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Mcp-Session-Id")
+				w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
 				w.Header().Set("Access-Control-Max-Age", "86400")
 			}
 			if r.Method == http.MethodOptions {
@@ -157,6 +168,12 @@ type statusRecorder struct {
 func (rec *statusRecorder) WriteHeader(code int) {
 	rec.statusCode = code
 	rec.ResponseWriter.WriteHeader(code)
+}
+
+func (rec *statusRecorder) Flush() {
+	if f, ok := rec.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
@@ -219,7 +236,15 @@ func (s *Server) Start() error {
 // Shutdown gracefully stops the HTTP server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down HTTP server")
+	if s.sessionMgr != nil {
+		s.sessionMgr.Close()
+	}
 	return s.httpServer.Shutdown(ctx)
+}
+
+// SessionManager returns the MCP session manager if HTTP transport is enabled.
+func (s *Server) SessionManager() *httptransport.SessionManager {
+	return s.sessionMgr
 }
 
 // Handler returns the underlying http.Handler for testing.

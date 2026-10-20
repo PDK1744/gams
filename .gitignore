@@ -18,7 +18,13 @@ coverage.out
 
 # Local config & secrets
 .env
+*.env
 *.local.toml
+
+# Demo run artifacts
+demo_server.log
+demo_server.pid
+demo_*.out
 
 # IDE & OS
 .DS_Store

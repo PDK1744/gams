@@ -209,3 +209,20 @@ type CreateAPIKeyResponse struct {
 	CreatedAt int64  `json:"created_at"`
 	ExpiresAt *int64 `json:"expires_at,omitempty"`
 }
+
+// NamespaceActivity represents claim volume activity for a namespace.
+type NamespaceActivity struct {
+	NamespaceSlug string `json:"namespace_slug"`
+	ClaimCount    int64  `json:"claim_count"`
+}
+
+// TenantSummary represents aggregate statistics across all namespaces for an operator.
+type TenantSummary struct {
+	TenantID             string              `json:"tenant_id"`
+	TenantName           string              `json:"tenant_name"`
+	TotalClaims          int64               `json:"total_claims"`
+	ClaimsByStatus       map[string]int64    `json:"claims_by_status"`
+	WritesLast7Days      int64               `json:"writes_last_7_days"`
+	WritesLast30Days     int64               `json:"writes_last_30_days"`
+	MostActiveNamespaces []NamespaceActivity `json:"most_active_namespaces"`
+}

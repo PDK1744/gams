@@ -1377,6 +1377,70 @@ func (e *Engine) GetTenant(ctx context.Context, id string) (*types.Tenant, error
 	return &t, nil
 }
 
+func (e *Engine) GetTenantSummary(ctx context.Context, tenantID string) (*types.TenantSummary, error) {
+	tenant, err := e.GetTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	var totalClaims int64
+	_ = e.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM claims WHERE tenant_id = ?", tenantID).Scan(&totalClaims)
+
+	statusMap := map[string]int64{"active": 0, "contradicted": 0, "forgotten": 0}
+	rows, err := e.db.QueryContext(ctx, "SELECT status, COUNT(*) FROM claims WHERE tenant_id = ? GROUP BY status", tenantID)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var st string
+			var count int64
+			if err := rows.Scan(&st, &count); err == nil {
+				statusMap[st] = count
+			}
+		}
+	}
+
+	now := types.NowNano()
+	sevenDaysAgo := now - int64(7*24*time.Hour)
+	thirtyDaysAgo := now - int64(30*24*time.Hour)
+
+	var writes7, writes30 int64
+	_ = e.db.QueryRowContext(ctx,
+		`SELECT
+			COALESCE(COUNT(CASE WHEN occurred_at >= ? THEN 1 END), 0),
+			COUNT(1)
+		 FROM audit_log
+		 WHERE tenant_id = ? AND event_type = ? AND occurred_at >= ?`,
+		sevenDaysAgo, tenantID, audit.EventWrite, thirtyDaysAgo).Scan(&writes7, &writes30)
+
+	var mostActive []types.NamespaceActivity
+	actRows, err := e.db.QueryContext(ctx,
+		`SELECT ns.slug, COUNT(c.id) as cnt
+		 FROM claims c
+		 JOIN namespaces ns ON ns.id = c.namespace_id
+		 WHERE c.tenant_id = ?
+		 GROUP BY c.namespace_id
+		 ORDER BY cnt DESC LIMIT 5`, tenantID)
+	if err == nil {
+		defer actRows.Close()
+		for actRows.Next() {
+			var act types.NamespaceActivity
+			if err := actRows.Scan(&act.NamespaceSlug, &act.ClaimCount); err == nil {
+				mostActive = append(mostActive, act)
+			}
+		}
+	}
+
+	return &types.TenantSummary{
+		TenantID:             tenant.ID,
+		TenantName:           tenant.Name,
+		TotalClaims:          totalClaims,
+		ClaimsByStatus:       statusMap,
+		WritesLast7Days:      writes7,
+		WritesLast30Days:     writes30,
+		MostActiveNamespaces: mostActive,
+	}, nil
+}
+
 func (e *Engine) ListTenants(ctx context.Context) ([]types.Tenant, error) {
 	rows, err := e.db.QueryContext(ctx,
 		`SELECT id, name, status, recall_decay_lambda, max_claims, auto_create_namespaces, created_at, metadata
