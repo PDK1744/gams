@@ -28,11 +28,6 @@ func main() {
 }
 
 func run(args []string) error {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
-
 	if len(args) > 0 {
 		switch args[0] {
 		case "version", "--version", "-v":
@@ -49,6 +44,8 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	configPath := fs.String("config", "gams.toml", "path to configuration file")
 	devMode := fs.Bool("dev", false, "run in development mode (permits empty admin key)")
+	transportFlag := fs.String("transport", "", "MCP transport to run: http | stdio | both (overrides config)")
+	apiKeyFlag := fs.String("api-key", "", "API key to bind for stdio session (optional; bootstraps local tenant if empty)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -56,6 +53,27 @@ func run(args []string) error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return fmt.Errorf("loading configuration: %w", err)
+	}
+
+	if *transportFlag != "" {
+		cfg.MCP.Transport = *transportFlag
+	}
+
+	// In stdio or both mode, stdout is strictly reserved for JSON-RPC 2.0 messages;
+	// all operational logs must be emitted to stderr.
+	logOut := os.Stdout
+	if cfg.MCP.Transport == "stdio" || cfg.MCP.Transport == "both" {
+		logOut = os.Stderr
+	}
+
+	logger := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
+	apiKey := *apiKeyFlag
+	if apiKey == "" {
+		apiKey = os.Getenv("GAMS_API_KEY")
 	}
 
 	isDev := *devMode || os.Getenv("GAMS_DEV") == "true" || os.Getenv("GAMS_ENV") == "development"
@@ -82,33 +100,86 @@ func run(args []string) error {
 
 	srv := server.New(cfg, database, Version, logger, server.WithDevMode(isDev))
 
-	// Listen for OS shutdown signals (os.Interrupt covers SIGINT on Unix/Windows)
+	// Listen for OS shutdown signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	errChan := make(chan error, 1)
-	go func() {
-		if err := srv.Start(); err != nil {
-			errChan <- err
+	switch cfg.MCP.Transport {
+	case "stdio":
+		stdioErrChan := make(chan error, 1)
+		go func() {
+			stdioErrChan <- srv.RunStdio(ctx, os.Stdin, os.Stdout, apiKey)
+		}()
+
+		select {
+		case sig := <-sigChan:
+			logger.Info("received termination signal", "signal", sig.String())
+			cancel()
+			return nil
+		case err := <-stdioErrChan:
+			if err != nil {
+				return fmt.Errorf("stdio error: %w", err)
+			}
+			return nil
 		}
-	}()
 
-	select {
-	case sig := <-sigChan:
-		logger.Info("received termination signal", "signal", sig.String())
-	case err := <-errChan:
-		return fmt.Errorf("server error: %w", err)
+	case "both":
+		httpErrChan := make(chan error, 1)
+		go func() {
+			if err := srv.Start(); err != nil {
+				httpErrChan <- err
+			}
+		}()
+
+		stdioErrChan := make(chan error, 1)
+		go func() {
+			stdioErrChan <- srv.RunStdio(ctx, os.Stdin, os.Stdout, apiKey)
+		}()
+
+		select {
+		case sig := <-sigChan:
+			logger.Info("received termination signal", "signal", sig.String())
+			cancel()
+		case err := <-httpErrChan:
+			cancel()
+			return fmt.Errorf("http server error in dual transport: %w", err)
+		case err := <-stdioErrChan:
+			cancel()
+			if err != nil {
+				logger.Error("stdio session ended with error", "error", err)
+			}
+		}
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = srv.Shutdown(shutdownCtx)
+		return nil
+
+	default: // "http"
+		errChan := make(chan error, 1)
+		go func() {
+			if err := srv.Start(); err != nil {
+				errChan <- err
+			}
+		}()
+
+		select {
+		case sig := <-sigChan:
+			logger.Info("received termination signal", "signal", sig.String())
+		case err := <-errChan:
+			return fmt.Errorf("server error: %w", err)
+		}
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("server shutdown error: %w", err)
+		}
+
+		logger.Info("GAMS server stopped cleanly")
+		return nil
 	}
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("server shutdown error: %w", err)
-	}
-
-	logger.Info("GAMS server stopped cleanly")
-	return nil
 }
 
 func printUsage() {
@@ -123,8 +194,10 @@ Commands:
   help        Show this help message
 
 Options for 'serve':
-  --config    Path to TOML configuration file (default: gams.toml)
-  --dev       Enable development mode (permits unauthenticated admin endpoints)
+  --config       Path to TOML configuration file (default: gams.toml)
+  --transport    MCP transport to run: http | stdio | both (default: http)
+  --api-key      API key for stdio session (optional; auto-provisions if empty)
+  --dev          Enable development mode (permits unauthenticated admin endpoints)
 `)
 }
 

@@ -31,6 +31,15 @@ demo_*.out
 .idea/
 .vscode/
 
+# Node / SDKs
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+
 
 MEMORY.md
 REVIEW.md

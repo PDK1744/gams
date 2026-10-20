@@ -2,7 +2,7 @@ BINARY_NAME=gams
 VERSION ?= 0.1.0
 LDFLAGS := -X 'main.Version=$(VERSION)' -s -w
 
-.PHONY: all build test lint run clean
+.PHONY: all build test test-sdk lint run clean
 
 all: build
 
@@ -11,6 +11,9 @@ build:
 
 test:
 	go test -v -race ./...
+
+test-sdk:
+	cd sdks/client-ts && npm test
 
 lint:
 	go vet ./...

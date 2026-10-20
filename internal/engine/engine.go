@@ -1441,6 +1441,83 @@ func (e *Engine) GetTenantSummary(ctx context.Context, tenantID string) (*types.
 	}, nil
 }
 
+// EnsureLocalWorkspaceTenant returns (or provisions) the default local tenant and an active API key
+// for zero-config local MCP hosts (such as Claude Code or Cursor over stdio).
+func (e *Engine) EnsureLocalWorkspaceTenant(ctx context.Context) (*types.APIKey, *types.Tenant, error) {
+	var tenantID string
+	err := e.db.QueryRowContext(ctx, "SELECT id FROM tenants WHERE id = 'local' OR name = 'Local Workspace' LIMIT 1").Scan(&tenantID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, fmt.Errorf("checking local tenant: %w", err)
+	}
+
+	if errors.Is(err, sql.ErrNoRows) {
+		now := types.NowNano()
+		tx, txErr := e.db.BeginTx(ctx, &sql.TxOptions{})
+		if txErr != nil {
+			return nil, nil, fmt.Errorf("starting transaction: %w", txErr)
+		}
+		defer tx.Rollback()
+
+		tenantID = "local"
+		_, txErr = tx.ExecContext(ctx,
+			`INSERT INTO tenants (id, name, status, recall_decay_lambda, max_claims, auto_create_namespaces, created_at, metadata)
+			 VALUES (?, 'Local Workspace', 'active', 0.05, 0, 1, ?, '{}')`,
+			tenantID, now)
+		if txErr != nil {
+			return nil, nil, fmt.Errorf("inserting local tenant: %w", txErr)
+		}
+
+		defaultNSID := types.NewUUIDv7()
+		_, txErr = tx.ExecContext(ctx,
+			`INSERT INTO namespaces (id, tenant_id, slug, name, status, access_mode, created_at, updated_at)
+			 VALUES (?, ?, 'default', 'Default', 'active', 'tenant_wide', ?, ?)`,
+			defaultNSID, tenantID, now, now)
+		if txErr != nil {
+			return nil, nil, fmt.Errorf("creating default namespace: %w", txErr)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return nil, nil, fmt.Errorf("committing local tenant: %w", err)
+		}
+	}
+
+	tenant, err := e.GetTenant(ctx, tenantID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if tenant.Status != "active" {
+		return nil, nil, fmt.Errorf("%w: local workspace tenant %q is %s", ErrForbidden, tenantID, tenant.Status)
+	}
+
+	// Find or issue an active API key for this tenant
+	var key types.APIKey
+	row := e.db.QueryRowContext(ctx,
+		`SELECT id, tenant_id, key_hash, label, status, created_at, expires_at, last_used_at
+		 FROM api_keys WHERE tenant_id = ? AND status = 'active' LIMIT 1`, tenantID)
+	err = row.Scan(&key.ID, &key.TenantID, &key.KeyHash, &key.Label, &key.Status, &key.CreatedAt, &key.ExpiresAt, &key.LastUsedAt)
+	if err == nil {
+		return &key, tenant, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, fmt.Errorf("querying api key: %w", err)
+	}
+
+	keyResp, err := e.CreateAPIKey(ctx, tenantID, &types.CreateAPIKeyRequest{
+		Label: "local-stdio-key",
+	}, "system", "system")
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating local api key: %w", err)
+	}
+
+	actor, _, err := e.authSvc.VerifyAPIKey(ctx, keyResp.Key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("verifying local api key: %w", err)
+	}
+
+	return actor, tenant, nil
+}
+
 func (e *Engine) ListTenants(ctx context.Context) ([]types.Tenant, error) {
 	rows, err := e.db.QueryContext(ctx,
 		`SELECT id, name, status, recall_decay_lambda, max_claims, auto_create_namespaces, created_at, metadata

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,6 +18,8 @@ import (
 	"github.com/PDK1744/gams/internal/engine"
 	"github.com/PDK1744/gams/internal/mcp"
 	httptransport "github.com/PDK1744/gams/internal/transport/http"
+	stdiotransport "github.com/PDK1744/gams/internal/transport/stdio"
+	"github.com/PDK1744/gams/pkg/types"
 )
 
 // Server encapsulates the HTTP server for GAMS.
@@ -240,6 +243,31 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.sessionMgr.Close()
 	}
 	return s.httpServer.Shutdown(ctx)
+}
+
+// RunStdio executes the MCP server over standard I/O streams using the provided raw key (optional).
+// If apiKey is empty, it bootstraps or binds to the local workspace tenant for zero-config operation.
+func (s *Server) RunStdio(ctx context.Context, in io.Reader, out io.Writer, apiKey string) error {
+	var actor *types.APIKey
+	var tenant *types.Tenant
+
+	if apiKey != "" {
+		var err error
+		actor, tenant, err = s.engine.Auth().VerifyAPIKey(ctx, apiKey)
+		if err != nil {
+			return fmt.Errorf("verifying stdio api key: %w", err)
+		}
+	} else {
+		var err error
+		actor, tenant, err = s.engine.EnsureLocalWorkspaceTenant(ctx)
+		if err != nil {
+			return fmt.Errorf("bootstrapping local workspace tenant for stdio: %w", err)
+		}
+	}
+
+	dispatcher := mcp.NewDispatcher(s.engine, s.version)
+	handler := stdiotransport.NewHandler(dispatcher, actor, tenant, s.logger)
+	return handler.Run(ctx, in, out)
 }
 
 // SessionManager returns the MCP session manager if HTTP transport is enabled.
