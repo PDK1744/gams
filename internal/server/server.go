@@ -6,10 +6,15 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
+	"github.com/PDK1744/gams/internal/admin"
+	"github.com/PDK1744/gams/internal/api"
+	"github.com/PDK1744/gams/internal/auth"
 	"github.com/PDK1744/gams/internal/config"
 	"github.com/PDK1744/gams/internal/db"
+	"github.com/PDK1744/gams/internal/engine"
 )
 
 // Server encapsulates the HTTP server for GAMS.
@@ -19,6 +24,18 @@ type Server struct {
 	version    string
 	httpServer *http.Server
 	logger     *slog.Logger
+	engine     *engine.Engine
+	devMode    bool
+}
+
+// Option configures Server instances.
+type Option func(*Server)
+
+// WithDevMode configures development mode behavior.
+func WithDevMode(dev bool) Option {
+	return func(s *Server) {
+		s.devMode = dev
+	}
 }
 
 // HealthResponse represents the payload returned by the /health endpoint.
@@ -29,20 +46,41 @@ type HealthResponse struct {
 }
 
 // New creates a new HTTP Server instance.
-func New(cfg *config.Config, database *db.DB, version string, logger *slog.Logger) *Server {
+func New(cfg *config.Config, database *db.DB, version string, logger *slog.Logger, opts ...Option) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
+
+	isDev := os.Getenv("GAMS_DEV") == "true" || os.Getenv("GAMS_ENV") == "development"
 
 	s := &Server{
 		cfg:     cfg,
 		db:      database,
 		version: version,
 		logger:  logger,
+		devMode: isDev,
 	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	// Initialize Auth, Engine, and Handlers
+	keyTTL := time.Duration(cfg.Auth.KeyCacheTTLSeconds) * time.Second
+	if keyTTL <= 0 {
+		keyTTL = 300 * time.Second
+	}
+	authSvc := auth.NewService(database.DB, cfg.Server.AdminKey, keyTTL)
+	eng := engine.New(database, authSvc, cfg, version)
+	s.engine = eng
+
+	adminHandler := admin.NewHandler(eng, s.devMode)
+	apiHandler := api.NewHandler(eng)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
+	adminHandler.RegisterRoutes(mux)
+	apiHandler.RegisterRoutes(mux)
 
 	s.httpServer = &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.HTTPPort),
@@ -56,8 +94,43 @@ func New(cfg *config.Config, database *db.DB, version string, logger *slog.Logge
 	return s
 }
 
+// Engine returns the underlying core engine instance.
+func (s *Server) Engine() *engine.Engine {
+	return s.engine
+}
+
 func (s *Server) wrapMiddleware(handler http.Handler) http.Handler {
-	return s.recoverMiddleware(s.loggingMiddleware(handler))
+	return s.recoverMiddleware(s.loggingMiddleware(s.corsMiddleware(handler)))
+}
+
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(s.cfg.Server.CORSOrigins) > 0 {
+			origin := r.Header.Get("Origin")
+			allowed := false
+			for _, o := range s.cfg.Server.CORSOrigins {
+				if o == "*" || o == origin {
+					allowed = true
+					break
+				}
+			}
+			if allowed {
+				if origin != "" {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+				} else {
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+				}
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+				w.Header().Set("Access-Control-Max-Age", "86400")
+			}
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
@@ -153,4 +226,3 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (s *Server) Handler() http.Handler {
 	return s.httpServer.Handler
 }
-

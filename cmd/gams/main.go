@@ -80,7 +80,7 @@ func run(args []string) error {
 		}
 	}()
 
-	srv := server.New(cfg, database, Version, logger)
+	srv := server.New(cfg, database, Version, logger, server.WithDevMode(isDev))
 
 	// Listen for OS shutdown signals (os.Interrupt covers SIGINT on Unix/Windows)
 	sigChan := make(chan os.Signal, 1)
