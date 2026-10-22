@@ -222,6 +222,15 @@ func TestAdminNamespaceAndKeyManagement(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("expected 204 for key revoke, got %d", rec.Code)
 	}
+
+	// Create namespace under non-existent tenant returns 404 (CR-006)
+	rec = doRequest(srv, http.MethodPost, "/admin/tenants/non-existent-tenant-uuid/namespaces", adminKey, types.CreateNamespaceRequest{
+		Slug: "orphan-ns",
+		Name: "Orphan Namespace",
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when creating namespace for non-existent tenant, got %d: %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestAdminForgetClaim(t *testing.T) {

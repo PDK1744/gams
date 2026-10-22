@@ -225,3 +225,97 @@ func TestCheckNamespaceAccess(t *testing.T) {
 		t.Errorf("expected ErrNamespaceAccessDenied for admin with write grant, got: %v", err)
 	}
 }
+
+func TestAPIKeyExpiration(t *testing.T) {
+	testDB := setupTestDB(t)
+	ctx := context.Background()
+	svc := NewService(testDB.DB, "admin", 1*time.Minute)
+
+	tenantID := types.NewUUIDv7()
+	now := types.NowNano()
+
+	// Insert tenant
+	_, err := testDB.ExecContext(ctx,
+		`INSERT INTO tenants (id, name, status, recall_decay_lambda, max_claims, auto_create_namespaces, created_at, metadata)
+		 VALUES (?, 'Expiry Tenant', 'active', 0.05, 0, 0, ?, '{}')`,
+		tenantID, now)
+	if err != nil {
+		t.Fatalf("inserting tenant: %v", err)
+	}
+
+	// 1. Expired Key (expired 1 hour ago)
+	expiredRawKey, expiredHash, err := GenerateAPIKey(tenantID)
+	if err != nil {
+		t.Fatalf("generating expired key: %v", err)
+	}
+	expiredAt := now - int64(1*time.Hour)
+	_, err = testDB.ExecContext(ctx,
+		`INSERT INTO api_keys (id, tenant_id, key_hash, label, status, last_used_at, expires_at, created_at)
+		 VALUES (?, ?, ?, 'expired-key', 'active', 0, ?, ?)`,
+		types.NewUUIDv7(), tenantID, expiredHash, expiredAt, now)
+	if err != nil {
+		t.Fatalf("inserting expired key: %v", err)
+	}
+
+	_, _, err = svc.VerifyAPIKey(ctx, expiredRawKey)
+	if err != ErrInvalidAPIKey {
+		t.Fatalf("expected ErrInvalidAPIKey for expired key, got: %v", err)
+	}
+
+	// 2. Future Valid Key (expires in 10 minutes)
+	futureRawKey, futureHash, err := GenerateAPIKey(tenantID)
+	if err != nil {
+		t.Fatalf("generating future key: %v", err)
+	}
+	futureExpiry := now + int64(10*time.Minute)
+	futureKeyID := types.NewUUIDv7()
+	_, err = testDB.ExecContext(ctx,
+		`INSERT INTO api_keys (id, tenant_id, key_hash, label, status, last_used_at, expires_at, created_at)
+		 VALUES (?, ?, ?, 'future-key', 'active', 0, ?, ?)`,
+		futureKeyID, tenantID, futureHash, futureExpiry, now)
+	if err != nil {
+		t.Fatalf("inserting future key: %v", err)
+	}
+
+	key, _, err := svc.VerifyAPIKey(ctx, futureRawKey)
+	if err != nil {
+		t.Fatalf("expected valid future key to succeed, got: %v", err)
+	}
+	if key.ID != futureKeyID {
+		t.Fatalf("expected key id %s, got %s", futureKeyID, key.ID)
+	}
+
+	// 3. Cached Key Expiration Eviction
+	transientRawKey, transientHash, err := GenerateAPIKey(tenantID)
+	if err != nil {
+		t.Fatalf("generating transient key: %v", err)
+	}
+	transientExpiry := now + int64(10*time.Minute)
+	transientKeyID := types.NewUUIDv7()
+	_, err = testDB.ExecContext(ctx,
+		`INSERT INTO api_keys (id, tenant_id, key_hash, label, status, last_used_at, expires_at, created_at)
+		 VALUES (?, ?, ?, 'transient-key', 'active', 0, ?, ?)`,
+		transientKeyID, tenantID, transientHash, transientExpiry, now)
+	if err != nil {
+		t.Fatalf("inserting transient key: %v", err)
+	}
+
+	// First verify succeeds and populates cache
+	key, _, err = svc.VerifyAPIKey(ctx, transientRawKey)
+	if err != nil {
+		t.Fatalf("expected initial verify to succeed, got: %v", err)
+	}
+	if key.ID != transientKeyID {
+		t.Fatalf("expected key id %s, got %s", transientKeyID, key.ID)
+	}
+
+	// Simulate expiration on the cached key without relying on race-sensitive wall-clock sleeps
+	expiredNano := types.NowNano() - int64(1*time.Second)
+	key.ExpiresAt = &expiredNano
+
+	// Second verify hits cache, detects expiration, evicts from cache, and returns ErrInvalidAPIKey
+	_, _, err = svc.VerifyAPIKey(ctx, transientRawKey)
+	if err != ErrInvalidAPIKey {
+		t.Fatalf("expected expired cached key to return ErrInvalidAPIKey, got: %v", err)
+	}
+}

@@ -84,6 +84,7 @@ type ClaimVersion struct {
 	Confidence   float64  `json:"confidence"`
 	Contradicts  []string `json:"contradicts"`
 	WriterID     string   `json:"writer_id"`
+	WriterLabel  string   `json:"writer_label,omitempty"`
 	WrittenAt    int64    `json:"written_at"`
 	ChangeReason *string  `json:"change_reason,omitempty"`
 }

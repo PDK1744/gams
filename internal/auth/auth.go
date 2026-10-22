@@ -244,10 +244,31 @@ func (s *Service) CheckNamespaceAccess(ctx context.Context, apiKey *types.APIKey
 	}
 
 	if ns.AccessMode == "tenant_wide" {
+		if requiredPerm == "admin" {
+			if apiKey == nil {
+				return ErrNamespaceAccessDenied
+			}
+			var perm string
+			err := s.db.QueryRowContext(ctx,
+				`SELECT permission FROM namespace_grants WHERE namespace_id = ? AND api_key_id = ?`,
+				ns.ID, apiKey.ID).Scan(&perm)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return ErrNamespaceAccessDenied
+				}
+				return fmt.Errorf("querying namespace grant: %w", err)
+			}
+			if perm != "admin" {
+				return ErrNamespaceAccessDenied
+			}
+		}
 		return nil
 	}
 
 	if ns.AccessMode == "key_restricted" {
+		if apiKey == nil {
+			return ErrNamespaceAccessDenied
+		}
 		var perm string
 		err := s.db.QueryRowContext(ctx,
 			`SELECT permission FROM namespace_grants WHERE namespace_id = ? AND api_key_id = ?`,

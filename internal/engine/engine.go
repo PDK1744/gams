@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -560,8 +561,12 @@ func (e *Engine) Recall(ctx context.Context, actor *types.APIKey, tenant *types.
 
 		m.claim.CreatedAt = types.FormatISO8601(createdNano)
 		m.claim.UpdatedAt = types.FormatISO8601(m.updatedNano)
-		if tagsJSON != "" && tagsJSON != "[]" {
+		m.claim.Tags = []string{}
+		if tagsJSON != "" && tagsJSON != "[]" && tagsJSON != "null" {
 			_ = json.Unmarshal([]byte(tagsJSON), &m.claim.Tags)
+		}
+		if m.claim.Tags == nil {
+			m.claim.Tags = []string{}
 		}
 
 		lambda := tenant.RecallDecayLambda
@@ -833,10 +838,12 @@ func (e *Engine) Inspect(ctx context.Context, actor *types.APIKey, tenant *types
 		}
 	}
 
-	// Fetch versions
+	// Fetch versions with writer labels
 	verRows, err := e.db.QueryContext(ctx,
-		`SELECT id, claim_id, tenant_id, namespace_id, version, content, confidence, contradicts, writer_id, written_at, change_reason
-		 FROM claim_versions WHERE claim_id = ? ORDER BY version ASC`, claimID)
+		`SELECT v.id, v.claim_id, v.tenant_id, v.namespace_id, v.version, v.content, v.confidence, v.contradicts, v.writer_id, v.written_at, v.change_reason, COALESCE(k.label, '')
+		 FROM claim_versions v
+		 LEFT JOIN api_keys k ON v.writer_id = k.id
+		 WHERE v.claim_id = ? ORDER BY v.version ASC`, claimID)
 	if err != nil {
 		return nil, fmt.Errorf("querying versions: %w", err)
 	}
@@ -847,15 +854,34 @@ func (e *Engine) Inspect(ctx context.Context, actor *types.APIKey, tenant *types
 		var v types.ClaimVersion
 		var contraJSON string
 		var chgReason sql.NullString
-		if err := verRows.Scan(&v.ID, &v.ClaimID, &v.TenantID, &v.NamespaceID, &v.Version, &v.Content, &v.Confidence, &contraJSON, &v.WriterID, &v.WrittenAt, &chgReason); err == nil {
-			if contraJSON != "" && contraJSON != "[]" {
-				_ = json.Unmarshal([]byte(contraJSON), &v.Contradicts)
-			}
-			if chgReason.Valid {
-				v.ChangeReason = &chgReason.String
-			}
-			versions = append(versions, v)
+		var writerLabel string
+		if err := verRows.Scan(&v.ID, &v.ClaimID, &v.TenantID, &v.NamespaceID, &v.Version, &v.Content, &v.Confidence, &contraJSON, &v.WriterID, &v.WrittenAt, &chgReason, &writerLabel); err != nil {
+			return nil, fmt.Errorf("scanning claim version row: %w", err)
 		}
+		v.Contradicts = []string{}
+		if contraJSON != "" && contraJSON != "[]" && contraJSON != "null" {
+			_ = json.Unmarshal([]byte(contraJSON), &v.Contradicts)
+		}
+		if v.Contradicts == nil {
+			v.Contradicts = []string{}
+		}
+		if chgReason.Valid {
+			v.ChangeReason = &chgReason.String
+		}
+		if writerLabel != "" {
+			v.WriterLabel = writerLabel
+		} else if v.WriterID == claim.WriterID && claim.WriterLabel != "" {
+			v.WriterLabel = claim.WriterLabel
+		} else {
+			v.WriterLabel = v.WriterID
+		}
+		versions = append(versions, v)
+	}
+	if err := verRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating claim versions: %w", err)
+	}
+	if versions == nil {
+		versions = []types.ClaimVersion{}
 	}
 
 	// Fetch evidence
@@ -871,12 +897,19 @@ func (e *Engine) Inspect(ctx context.Context, actor *types.APIKey, tenant *types
 	for evRows.Next() {
 		var ev types.Evidence
 		var evMeta string
-		if err := evRows.Scan(&ev.ID, &ev.ClaimID, &ev.ClaimVersion, &ev.TenantID, &ev.URI, &ev.Description, &ev.EvidenceType, &ev.CapturedAt, &evMeta); err == nil {
-			if evMeta != "" && evMeta != "{}" {
-				_ = json.Unmarshal([]byte(evMeta), &ev.Metadata)
-			}
-			evidence = append(evidence, ev)
+		if err := evRows.Scan(&ev.ID, &ev.ClaimID, &ev.ClaimVersion, &ev.TenantID, &ev.URI, &ev.Description, &ev.EvidenceType, &ev.CapturedAt, &evMeta); err != nil {
+			return nil, fmt.Errorf("scanning evidence row: %w", err)
 		}
+		if evMeta != "" && evMeta != "{}" {
+			_ = json.Unmarshal([]byte(evMeta), &ev.Metadata)
+		}
+		evidence = append(evidence, ev)
+	}
+	if err := evRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating evidence rows: %w", err)
+	}
+	if evidence == nil {
+		evidence = []types.Evidence{}
 	}
 
 	// Fetch audit trail for this specific claim using SQL filter
@@ -885,8 +918,12 @@ func (e *Engine) Inspect(ctx context.Context, actor *types.APIKey, tenant *types
 		ClaimID:  &claimID,
 		Limit:    100,
 	})
-	if err != nil {
+	if err != nil || claimAudit == nil {
 		claimAudit = []types.AuditEvent{}
+	}
+
+	if claim.Tags == nil {
+		claim.Tags = []string{}
 	}
 
 	return &types.InspectResponse{
@@ -961,6 +998,10 @@ func (e *Engine) resolveOrCreateNamespace(ctx context.Context, tenant *types.Ten
 }
 
 func (e *Engine) CreateNamespace(ctx context.Context, tenantID string, req *types.CreateNamespaceRequest, actorID, actorLabel string) (*types.Namespace, error) {
+	if _, err := e.GetTenant(ctx, tenantID); err != nil {
+		return nil, err
+	}
+
 	slug := strings.TrimSpace(req.Slug)
 	name := strings.TrimSpace(req.Name)
 	if slug == "" {
@@ -1716,6 +1757,13 @@ func calculateContentHash(content, tenantID, namespaceID string) string {
 func marshalJSONOr(v any, fallback string) string {
 	if v == nil {
 		return fallback
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Map, reflect.Pointer, reflect.Interface:
+		if rv.IsNil() {
+			return fallback
+		}
 	}
 	b, err := json.Marshal(v)
 	if err != nil {

@@ -41,5 +41,17 @@ yarn-error.log*
 .npm/
 
 
+# Python / SDKs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+.eggs/
+build/
+.ruff_cache/
+.mypy_cache/
+
 MEMORY.md
 REVIEW.md

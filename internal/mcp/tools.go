@@ -222,6 +222,9 @@ func ExecuteTool(ctx context.Context, eng *engine.Engine, actor *types.APIKey, t
 		if err := json.Unmarshal(args, &req); err != nil {
 			return makeErrorResult(fmt.Sprintf("invalid arguments for inspect: %v", err)), nil
 		}
+		if req.ClaimID == "" {
+			return makeErrorResult("claim_id is required"), nil
+		}
 
 		resp, err := eng.Inspect(ctx, actor, tenant, req.ClaimID)
 		if err != nil {

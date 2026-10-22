@@ -83,7 +83,7 @@ func Open(ctx context.Context, dbPath string) (*DB, error) {
 // Applying these as DSN parameters ensures every connection created by the pool
 // receives foreign_keys, busy_timeout, and WAL mode.
 func buildDSN(dbPath string) string {
-	pragmas := "_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)"
+	pragmas := "_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_txlock=immediate"
 	if dbPath != ":memory:" && !strings.Contains(dbPath, ":memory:") {
 		pragmas += "&_pragma=journal_mode(WAL)"
 	}

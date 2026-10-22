@@ -459,6 +459,68 @@ func TestNamespaceAdminCanForget(t *testing.T) {
 	}
 }
 
+func TestTenantWideNonWriterCannotForgetWithoutAdminGrant(t *testing.T) {
+	ctx := context.Background()
+	eng, tenant, agentA := setupTestEngine(t)
+
+	// Create tenant_wide namespace
+	ns, err := eng.CreateNamespace(ctx, tenant.ID, &types.CreateNamespaceRequest{
+		Slug:       "open-collab",
+		Name:       "Open Collab Space",
+		AccessMode: "tenant_wide",
+	}, "admin", "admin")
+	if err != nil {
+		t.Fatalf("creating namespace: %v", err)
+	}
+
+	// Create agentB (regular agent without admin grant)
+	keyB, err := eng.CreateAPIKey(ctx, tenant.ID, &types.CreateAPIKeyRequest{Label: "agent-b"}, "admin", "admin")
+	if err != nil {
+		t.Fatalf("creating key: %v", err)
+	}
+	agentB := &types.APIKey{ID: keyB.ID, TenantID: tenant.ID, Label: keyB.Label, Status: keyB.Status}
+
+	// AgentA writes a claim
+	claim, err := eng.Remember(ctx, agentA, tenant, &types.RememberRequest{
+		Namespace:  ns.Slug,
+		Content:    "Original memory authored by Agent A",
+		Confidence: 0.9,
+		Evidence: []types.EvidenceInput{
+			{URI: "file://notes.txt", Description: "Agent A notes", EvidenceType: "file"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("remember failed: %v", err)
+	}
+
+	// AgentB tries to forget AgentA's claim: MUST fail with ErrForbidden (CR-001)
+	_, err = eng.Forget(ctx, agentB, tenant, claim.ClaimID, "malicious deletion by non-author")
+	if err == nil {
+		t.Fatalf("expected error when non-author attempts to forget claim in tenant_wide namespace, got nil")
+	}
+	if !errors.Is(err, ErrForbidden) {
+		t.Fatalf("expected ErrForbidden, got: %v", err)
+	}
+
+	// Now grant agentB admin permission on open-collab
+	_, err = eng.CreateGrant(ctx, tenant.ID, ns.Slug, &types.CreateGrantRequest{
+		APIKeyID:   agentB.ID,
+		Permission: "admin",
+	}, "admin", "admin")
+	if err != nil {
+		t.Fatalf("creating grant: %v", err)
+	}
+
+	// AgentB retries with admin grant: MUST succeed
+	forgetResp, err := eng.Forget(ctx, agentB, tenant, claim.ClaimID, "authorized deletion by namespace admin")
+	if err != nil {
+		t.Fatalf("expected forget to succeed after admin grant issued, got: %v", err)
+	}
+	if forgetResp.ClaimID != claim.ClaimID {
+		t.Fatalf("unexpected claim id in forget response: %s", forgetResp.ClaimID)
+	}
+}
+
 func TestNamespaceAutoCreateFlag(t *testing.T) {
 	ctx := context.Background()
 	eng, tenant, apiKey := setupTestEngine(t)

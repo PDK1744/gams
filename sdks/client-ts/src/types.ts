@@ -9,7 +9,19 @@ export interface EvidenceItem {
   uri: string;
   description: string;
   evidence_type: EvidenceType;
-  captured_at?: string;
+  captured_at?: string | number;
+  metadata?: Record<string, any>;
+}
+
+export interface EvidenceRecord {
+  id?: string;
+  claim_id?: string;
+  claim_version?: number;
+  tenant_id?: string;
+  uri: string;
+  description: string;
+  evidence_type: EvidenceType;
+  captured_at: string | number;
   metadata?: Record<string, any>;
 }
 
@@ -86,34 +98,50 @@ export interface Claim {
   content_hash: string;
   confidence: number;
   status: string;
-  created_at: string;
-  updated_at: string;
-  forgotten_at?: string | null;
+  writer_id?: string;
+  writer_label?: string;
+  tags?: string[];
+  created_at: string | number;
+  updated_at: string | number;
+  forgotten_at?: string | number | null;
   forgotten_reason?: string | null;
+  contradicted_by?: string | null;
   metadata?: Record<string, any>;
 }
 
 export interface ClaimVersion {
+  id?: string;
+  claim_id?: string;
+  tenant_id?: string;
+  namespace_id?: string;
   version: number;
   content: string;
   confidence: number;
-  writer_label: string;
-  written_at: string;
+  writer_id?: string;
+  writer_label?: string;
+  written_at: string | number;
   change_reason?: string | null;
   contradicts: string[];
 }
 
 export interface AuditEvent {
+  id?: string;
+  tenant_id?: string;
+  namespace_id?: string;
   event_type: string;
-  actor_label: string;
-  occurred_at: string;
+  actor_key_id?: string;
+  actor_label?: string;
+  claim_id?: string;
+  claim_version?: number;
+  occurred_at: string | number;
+  server_version?: string;
   payload?: Record<string, any>;
 }
 
 export interface InspectResult {
   claim: Claim;
   versions: ClaimVersion[];
-  evidence: EvidenceItem[];
+  evidence: (EvidenceItem | EvidenceRecord)[];
   audit: AuditEvent[];
 }
 

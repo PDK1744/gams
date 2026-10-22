@@ -145,6 +145,10 @@ func (h *Handler) handleRecall(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleInspect(w http.ResponseWriter, r *http.Request) {
 	apiKey, tenant, isAdmin := getIdentity(r.Context())
 	claimID := r.PathValue("id")
+	if claimID == "" {
+		writeError(w, http.StatusBadRequest, "claim id is required")
+		return
+	}
 
 	if isAdmin {
 		// Resolve tenant from claim for administrator inspection
@@ -163,6 +167,7 @@ func (h *Handler) handleInspect(w http.ResponseWriter, r *http.Request) {
 			handleError(w, err)
 			return
 		}
+		apiKey = nil
 	}
 
 	resp, err := h.eng.Inspect(r.Context(), apiKey, tenant, claimID)

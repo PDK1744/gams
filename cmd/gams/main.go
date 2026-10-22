@@ -36,6 +36,8 @@ func run(args []string) error {
 		case "help", "--help", "-h":
 			printUsage()
 			return nil
+		case "admin":
+			return runAdmin(args[1:])
 		case "serve":
 			args = args[1:]
 		}
@@ -190,6 +192,7 @@ Usage:
 
 Commands:
   serve       Start the GAMS server (default)
+  admin       Administrative commands (e.g. claims inspect)
   version     Show version information
   help        Show this help message
 
