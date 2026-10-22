@@ -47,6 +47,142 @@ curl http://localhost:8080/health
 
 ---
 
+## Streamable HTTP Server Deployment Guide
+
+Running GAMS as a shared Streamable HTTP server allows multiple agents, developer machines, and teams to connect concurrently to a single governed memory instance over standard Server-Sent Events (SSE) and JSON-RPC.
+
+### Step 1: Configure the Server & Admin Credential
+
+Set your listening address and an administrative key in `gams.toml` (or via environment variables):
+
+```toml
+[server]
+host = "0.0.0.0"       # Bind to all interfaces for network access
+http_port = 8080       # Port for MCP SSE, REST API, and metrics
+admin_key = "secret_admin_key_here" # Required to provision tenants & keys
+
+[data]
+path = "gams.db"       # SQLite WAL database path
+
+[limits]
+rate_limit_enabled = true
+rate_limit_rps = 100
+rate_limit_burst = 200
+```
+
+> **Environment Variables:** You can override any configuration setting using the `GAMS_` prefix:
+> ```bash
+> export GAMS_SERVER_HOST="0.0.0.0"
+> export GAMS_SERVER_HTTP_PORT="8080"
+> export GAMS_SERVER_ADMIN_KEY="secret_admin_key_here"
+> ```
+
+### Step 2: Start the GAMS Service
+
+#### Standalone Binary:
+```bash
+make build
+./gams serve --config gams.toml
+```
+
+#### Or Run with Docker:
+```bash
+docker run -d \
+  --name gams \
+  -p 8080:8080 \
+  -e GAMS_SERVER_ADMIN_KEY="secret_admin_key_here" \
+  -v gams-data:/data \
+  gams:latest
+```
+
+Verify service connectivity:
+```bash
+curl http://localhost:8080/health
+# {"status":"ok","version":"1.0.0","database":"connected"}
+```
+
+### Step 3: Create a Tenant via Admin API
+
+Every agent operates within a **Tenant** for strict memory boundary isolation. Create a tenant using your `admin_key`:
+
+```bash
+curl -X POST http://localhost:8080/admin/tenants \
+  -H "Authorization: Bearer secret_admin_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Team Engineering",
+    "auto_create_namespaces": true
+  }'
+```
+
+**Response (`201 Created`):**
+```json
+{
+  "id": "018f3a5b-9d41-71e8-a1c2-3e4b5c6d7e8f",
+  "name": "Team Engineering",
+  "status": "active",
+  "auto_create_namespaces": true
+}
+```
+*(Copy the generated tenant `id` for the next step).*
+
+### Step 4: Provision an Agent API Key
+
+Issue an API key for your tenant:
+
+```bash
+curl -X POST http://localhost:8080/admin/tenants/018f3a5b-9d41-71e8-a1c2-3e4b5c6d7e8f/keys \
+  -H "Authorization: Bearer secret_admin_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "claude-code-agent-1"
+  }'
+```
+
+**Response (`201 Created`):**
+```json
+{
+  "id": "018f3a5c-1234-71e8-9876-0a1b2c3d4e5f",
+  "tenant_id": "018f3a5b-9d41-71e8-a1c2-3e4b5c6d7e8f",
+  "label": "claude-code-agent-1",
+  "key": "gams_018f3a5b-9d41-71e8-a1c2-3e4b5c6d7e8f_a4f9b8c2d1e0374659b8c2d1e0374659",
+  "status": "active"
+}
+```
+
+> **Security Note:** The raw `key` string is shown **only once** upon generation. GAMS stores only the salted bcrypt hash.
+
+### Step 5: Connect MCP Clients & Agents
+
+Supply the URL (`/mcp/sse`) and bearer key to your MCP client:
+
+#### Antigravity CLI (`~/.gemini/config/mcp_config.json`) / Claude Code:
+```json
+{
+  "mcpServers": {
+    "gams": {
+      "url": "http://your-server-ip:8080/mcp/sse",
+      "headers": {
+        "Authorization": "Bearer gams_018f3a5b-9d41-71e8-a1c2-3e4b5c6d7e8f_a4f9b8c2d1e0374659b8c2d1e0374659"
+      }
+    }
+  }
+}
+```
+
+#### Python SDK (`gams-client`):
+```python
+from gams_client import AsyncGAMSClient
+
+async with AsyncGAMSClient(
+    base_url="http://your-server-ip:8080",
+    api_key="gams_018f3a5b-9d41-71e8-a1c2-3e4b5c6d7e8f_a4f9b8c2d1e0374659b8c2d1e0374659",
+) as client:
+    await client.remember(content="Architecture ADR-01 approved", evidence=[...])
+```
+
+---
+
 ## MCP Host Configuration
 
 GAMS integrates directly with standard MCP hosts like **Claude Code** and **Cursor**.
