@@ -2,7 +2,7 @@ BINARY_NAME=gams
 VERSION ?= 1.0.0
 LDFLAGS := -X 'main.Version=$(VERSION)' -s -w
 
-.PHONY: all build test test-all test-sdk test-sdk-ts test-sdk-py lint run docker-build clean
+.PHONY: all build test test-all test-sdk test-sdk-ts test-sdk-py bench lint run docker-build clean
 
 all: build
 
@@ -11,6 +11,10 @@ build:
 
 test:
 	go test -v -race ./...
+
+bench: build
+	go test -bench=. -benchmem -benchtime=2s ./internal/engine
+	python3 scripts/benchmark.py
 
 test-all: test test-sdk
 
