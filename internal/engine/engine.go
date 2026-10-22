@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"regexp"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"github.com/PDK1744/gams/internal/auth"
 	"github.com/PDK1744/gams/internal/config"
 	"github.com/PDK1744/gams/internal/db"
+	"github.com/PDK1744/gams/internal/metrics"
 	"github.com/PDK1744/gams/internal/scoring"
 	"github.com/PDK1744/gams/pkg/types"
 )
@@ -67,9 +69,19 @@ func (e *Engine) Audit() *audit.Logger {
 	return e.auditLogger
 }
 
+// Config returns the configuration.
+func (e *Engine) Config() *config.Config {
+	return e.cfg
+}
+
 // --- Remember Write Path ---
 
-func (e *Engine) Remember(ctx context.Context, actor *types.APIKey, tenant *types.Tenant, req *types.RememberRequest) (*types.RememberResponse, error) {
+func (e *Engine) Remember(ctx context.Context, actor *types.APIKey, tenant *types.Tenant, req *types.RememberRequest) (resp *types.RememberResponse, err error) {
+	start := time.Now()
+	defer func() {
+		metrics.Default().RecordWrite(time.Since(start), err == nil)
+	}()
+
 	if strings.TrimSpace(req.Content) == "" {
 		return nil, fmt.Errorf("%w: content cannot be empty", ErrInvalidInput)
 	}
@@ -157,8 +169,8 @@ func (e *Engine) Remember(ctx context.Context, actor *types.APIKey, tenant *type
 		}
 	}
 
-	// Begin IMMEDIATE transaction for serialization
-	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{})
+	// Begin IMMEDIATE transaction for serialization (LevelSerializable maps to BEGIN IMMEDIATE in pure-Go SQLite)
+	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return nil, fmt.Errorf("starting transaction: %w", err)
 	}
@@ -292,12 +304,12 @@ func (e *Engine) Remember(ctx context.Context, actor *types.APIKey, tenant *type
 			}, ErrConflict
 		}
 
-		// Idempotent hit: return existing claim
+		// Idempotent hit: return existing claim with status "idempotent"
 		return &types.RememberResponse{
 			ClaimID:   existingClaim.ID,
 			Version:   existingClaim.CurrentVersion,
 			CreatedAt: types.FormatISO8601(existingClaim.CreatedAt),
-			Status:    "created",
+			Status:    "idempotent",
 		}, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("checking idempotency: %w", err)
@@ -420,8 +432,11 @@ func (e *Engine) insertEvidence(ctx context.Context, tx *sql.Tx, claimID string,
 
 // --- Recall Read Path ---
 
-func (e *Engine) Recall(ctx context.Context, actor *types.APIKey, tenant *types.Tenant, req *types.RecallRequest) (*types.RecallResponse, error) {
+func (e *Engine) Recall(ctx context.Context, actor *types.APIKey, tenant *types.Tenant, req *types.RecallRequest) (resp *types.RecallResponse, err error) {
 	start := time.Now()
+	defer func() {
+		metrics.Default().RecordRecall(time.Since(start), err == nil)
+	}()
 
 	limit := req.Limit
 	if limit <= 0 {
@@ -619,7 +634,7 @@ func (e *Engine) Recall(ctx context.Context, actor *types.APIKey, tenant *types.
 
 	// Batch fetch evidence in a single query for the top-K claims
 	if len(results) > 0 {
-		e.batchPopulateEvidence(ctx, results)
+		results = e.batchPopulateEvidence(ctx, results)
 	}
 
 	// Audit log READ
@@ -643,9 +658,11 @@ func (e *Engine) Recall(ctx context.Context, actor *types.APIKey, tenant *types.
 	}, nil
 }
 
-func (e *Engine) batchPopulateEvidence(ctx context.Context, claims []types.RecalledClaim) {
+// batchPopulateEvidence populates evidence records for each claim and explicitly returns
+// the populated slice, ensuring mutation visibility regardless of caller allocation strategy.
+func (e *Engine) batchPopulateEvidence(ctx context.Context, claims []types.RecalledClaim) []types.RecalledClaim {
 	if len(claims) == 0 {
-		return
+		return claims
 	}
 
 	placeholders := make([]string, len(claims))
@@ -661,7 +678,7 @@ func (e *Engine) batchPopulateEvidence(ctx context.Context, claims []types.Recal
 
 	rows, err := e.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return
+		return claims
 	}
 	defer rows.Close()
 
@@ -691,6 +708,8 @@ func (e *Engine) batchPopulateEvidence(ctx context.Context, claims []types.Recal
 			claims[i].Evidence = []types.EvidenceInput{}
 		}
 	}
+
+	return claims
 }
 
 // --- Forget Soft Delete ---
@@ -732,7 +751,7 @@ func (e *Engine) Forget(ctx context.Context, actor *types.APIKey, tenant *types.
 	}
 
 	now := types.NowNano()
-	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{})
+	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return nil, fmt.Errorf("starting transaction: %w", err)
 	}
@@ -966,35 +985,44 @@ func (e *Engine) resolveOrCreateNamespace(ctx context.Context, tenant *types.Ten
 		UpdatedAt:  now,
 	}
 
-	_, err = e.db.ExecContext(ctx,
-		`INSERT INTO namespaces (id, tenant_id, slug, name, status, access_mode, created_at, updated_at)
+	res, err := e.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO namespaces (id, tenant_id, slug, name, status, access_mode, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, 'active', 'tenant_wide', ?, ?)`,
 		newNS.ID, tenant.ID, newNS.Slug, newNS.Name, now, now)
 	if err != nil {
 		return nil, fmt.Errorf("auto-creating namespace: %w", err)
 	}
 
-	actorKeyID := "system"
-	actorLabel := "system"
-	if actor != nil {
-		actorKeyID = actor.ID
-		actorLabel = actor.Label
+	// Always re-fetch the namespace to guarantee returning the canonical row even under concurrent insertion
+	canonicalNS, err := e.GetNamespace(ctx, tenant.ID, slug)
+	if err != nil {
+		return nil, fmt.Errorf("resolving auto-created namespace: %w", err)
 	}
 
-	_ = e.auditLogger.Log(ctx, e.db.DB, &types.AuditEvent{
-		TenantID:    tenant.ID,
-		NamespaceID: &newNS.ID,
-		EventType:   audit.EventNamespaceCreated,
-		ActorKeyID:  actorKeyID,
-		ActorLabel:  actorLabel,
-		Payload: map[string]any{
-			"auto_created": true,
-			"slug":         slug,
-		},
-		OccurredAt: now,
-	})
+	// Emit audit log only if this call actually performed the insertion
+	if rowsAff, _ := res.RowsAffected(); rowsAff > 0 {
+		actorKeyID := "system"
+		actorLabel := "system"
+		if actor != nil {
+			actorKeyID = actor.ID
+			actorLabel = actor.Label
+		}
 
-	return newNS, nil
+		_ = e.auditLogger.Log(ctx, e.db.DB, &types.AuditEvent{
+			TenantID:    tenant.ID,
+			NamespaceID: &canonicalNS.ID,
+			EventType:   audit.EventNamespaceCreated,
+			ActorKeyID:  actorKeyID,
+			ActorLabel:  actorLabel,
+			Payload: map[string]any{
+				"auto_created": true,
+				"slug":         slug,
+			},
+			OccurredAt: now,
+		})
+	}
+
+	return canonicalNS, nil
 }
 
 func (e *Engine) CreateNamespace(ctx context.Context, tenantID string, req *types.CreateNamespaceRequest, actorID, actorLabel string) (*types.Namespace, error) {
@@ -1341,7 +1369,7 @@ func (e *Engine) CreateTenant(ctx context.Context, req *types.CreateTenantReques
 	tenantID := types.NewUUIDv7()
 	metaJSON := marshalJSONOr(req.Metadata, "{}")
 
-	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{})
+	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return nil, fmt.Errorf("starting transaction: %w", err)
 	}
@@ -1493,7 +1521,7 @@ func (e *Engine) EnsureLocalWorkspaceTenant(ctx context.Context) (*types.APIKey,
 
 	if errors.Is(err, sql.ErrNoRows) {
 		now := types.NowNano()
-		tx, txErr := e.db.BeginTx(ctx, &sql.TxOptions{})
+		tx, txErr := e.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 		if txErr != nil {
 			return nil, nil, fmt.Errorf("starting transaction: %w", txErr)
 		}
@@ -1501,7 +1529,7 @@ func (e *Engine) EnsureLocalWorkspaceTenant(ctx context.Context) (*types.APIKey,
 
 		tenantID = "local"
 		_, txErr = tx.ExecContext(ctx,
-			`INSERT INTO tenants (id, name, status, recall_decay_lambda, max_claims, auto_create_namespaces, created_at, metadata)
+			`INSERT OR IGNORE INTO tenants (id, name, status, recall_decay_lambda, max_claims, auto_create_namespaces, created_at, metadata)
 			 VALUES (?, 'Local Workspace', 'active', 0.05, 0, 1, ?, '{}')`,
 			tenantID, now)
 		if txErr != nil {
@@ -1510,7 +1538,7 @@ func (e *Engine) EnsureLocalWorkspaceTenant(ctx context.Context) (*types.APIKey,
 
 		defaultNSID := types.NewUUIDv7()
 		_, txErr = tx.ExecContext(ctx,
-			`INSERT INTO namespaces (id, tenant_id, slug, name, status, access_mode, created_at, updated_at)
+			`INSERT OR IGNORE INTO namespaces (id, tenant_id, slug, name, status, access_mode, created_at, updated_at)
 			 VALUES (?, ?, 'default', 'Default', 'active', 'tenant_wide', ?, ?)`,
 			defaultNSID, tenantID, now, now)
 		if txErr != nil {
@@ -1520,6 +1548,12 @@ func (e *Engine) EnsureLocalWorkspaceTenant(ctx context.Context) (*types.APIKey,
 		if err := tx.Commit(); err != nil {
 			return nil, nil, fmt.Errorf("committing local tenant: %w", err)
 		}
+	}
+
+	// Re-fetch canonical local tenant to prevent TOCTOU races under concurrent provisioning
+	err = e.db.QueryRowContext(ctx, "SELECT id FROM tenants WHERE id = 'local' OR name = 'Local Workspace' LIMIT 1").Scan(&tenantID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("querying canonical local tenant: %w", err)
 	}
 
 	tenant, err := e.GetTenant(ctx, tenantID)
@@ -1641,7 +1675,7 @@ func (e *Engine) UpdateTenant(ctx context.Context, id string, req *types.UpdateT
 	})
 
 	// Invalidate cached identities for this tenant so updated configuration is immediately loaded
-	e.authSvc.ClearCache()
+	e.authSvc.InvalidateTenantCache(id)
 
 	return e.GetTenant(ctx, id)
 }
@@ -1783,4 +1817,304 @@ func AuditFilter(tenantID string, nsID, claimID, eventType *string, since, until
 		Limit:       limit,
 		Offset:      offset,
 	}
+}
+
+// --- Audit & Claims Export (Phase 5, Decision Q7) ---
+
+// ExportAudit streams all audit records for a tenant (and optionally namespace) as JSONL.
+// Every line contains mandatory schema_version: "1.0".
+func (e *Engine) ExportAudit(ctx context.Context, tenantID string, namespaceSlug *string, w io.Writer) error {
+	if _, err := e.GetTenant(ctx, tenantID); err != nil {
+		return err
+	}
+
+	var nsID *string
+	if namespaceSlug != nil && *namespaceSlug != "" {
+		ns, err := e.GetNamespace(ctx, tenantID, *namespaceSlug)
+		if err != nil {
+			return err
+		}
+		nsID = &ns.ID
+	}
+
+	query := `SELECT id, tenant_id, namespace_id, event_type, actor_key_id, actor_label,
+	                 claim_id, claim_version, payload, occurred_at, server_version
+	          FROM audit_log
+	          WHERE tenant_id = ?`
+	args := []any{tenantID}
+
+	if nsID != nil {
+		query += ` AND namespace_id = ?`
+		args = append(args, *nsID)
+	}
+	query += ` ORDER BY occurred_at ASC`
+
+	rows, err := e.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("querying audit log for export: %w", err)
+	}
+	defer rows.Close()
+
+	exportedAt := types.FormatISO8601(types.NowNano())
+
+	for rows.Next() {
+		var ev types.AuditEvent
+		var nsVal, claimVal sql.NullString
+		var verVal sql.NullInt64
+		var payloadStr string
+
+		if err := rows.Scan(
+			&ev.ID, &ev.TenantID, &nsVal, &ev.EventType, &ev.ActorKeyID, &ev.ActorLabel,
+			&claimVal, &verVal, &payloadStr, &ev.OccurredAt, &ev.ServerVersion,
+		); err != nil {
+			return fmt.Errorf("scanning audit event: %w", err)
+		}
+
+		if nsVal.Valid {
+			ev.NamespaceID = &nsVal.String
+		}
+		if claimVal.Valid {
+			ev.ClaimID = &claimVal.String
+		}
+		if verVal.Valid {
+			ev.ClaimVersion = &verVal.Int64
+		}
+		if payloadStr != "" && payloadStr != "{}" {
+			_ = json.Unmarshal([]byte(payloadStr), &ev.Payload)
+		}
+
+		record := types.AuditExportRecord{
+			SchemaVersion: "1.0",
+			ExportedAt:    exportedAt,
+			Event:         ev,
+		}
+
+		line, err := json.Marshal(record)
+		if err != nil {
+			return fmt.Errorf("marshaling audit export record: %w", err)
+		}
+		if _, err := w.Write(append(line, '\n')); err != nil {
+			return fmt.Errorf("writing audit export line: %w", err)
+		}
+	}
+
+	return rows.Err()
+}
+
+// ExportClaims streams a full snapshot of claims, versions, and evidence as JSONL.
+// Includes a header record and claim records, all with schema_version: "1.0".
+func (e *Engine) ExportClaims(ctx context.Context, tenantID string, namespaceSlug *string, w io.Writer) error {
+	if _, err := e.GetTenant(ctx, tenantID); err != nil {
+		return err
+	}
+
+	var nsID *string
+	var slugStr string
+	if namespaceSlug != nil && *namespaceSlug != "" {
+		ns, err := e.GetNamespace(ctx, tenantID, *namespaceSlug)
+		if err != nil {
+			return err
+		}
+		nsID = &ns.ID
+		slugStr = ns.Slug
+	}
+
+	// Count total claims
+	countQuery := `SELECT COUNT(*) FROM claims WHERE tenant_id = ?`
+	countArgs := []any{tenantID}
+	if nsID != nil {
+		countQuery += ` AND namespace_id = ?`
+		countArgs = append(countArgs, *nsID)
+	}
+	var totalCount int64
+	if err := e.db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&totalCount); err != nil {
+		return fmt.Errorf("counting claims for export: %w", err)
+	}
+
+	exportedAt := types.FormatISO8601(types.NowNano())
+
+	// Write header record
+	header := types.ClaimsExportHeader{
+		SchemaVersion: "1.0",
+		RecordType:    "header",
+		ExportedAt:    exportedAt,
+		TenantID:      tenantID,
+		NamespaceSlug: slugStr,
+		ClaimsCount:   totalCount,
+	}
+	headerLine, err := json.Marshal(header)
+	if err != nil {
+		return fmt.Errorf("marshaling claims export header: %w", err)
+	}
+	if _, err := w.Write(append(headerLine, '\n')); err != nil {
+		return fmt.Errorf("writing claims export header: %w", err)
+	}
+
+	// Query claims in bounded batches using keyset pagination on id
+	// (UUIDv7 is monotonically time-ordered, bounding memory consumption)
+	const batchSize = 500
+	var lastID string
+
+	for {
+		claimsQuery := `SELECT id, tenant_id, namespace_id, current_version, content, content_hash, confidence, status,
+		                       contradicted_by, writer_id, writer_label, tags, created_at, updated_at, forgotten_at, forgotten_reason, metadata
+		                FROM claims
+		                WHERE tenant_id = ?`
+		claimsArgs := []any{tenantID}
+		if nsID != nil {
+			claimsQuery += ` AND namespace_id = ?`
+			claimsArgs = append(claimsArgs, *nsID)
+		}
+		if lastID != "" {
+			claimsQuery += ` AND id > ?`
+			claimsArgs = append(claimsArgs, lastID)
+		}
+		claimsQuery += ` ORDER BY id ASC LIMIT ?`
+		claimsArgs = append(claimsArgs, batchSize)
+
+		rows, err := e.db.QueryContext(ctx, claimsQuery, claimsArgs...)
+		if err != nil {
+			return fmt.Errorf("querying claims for export: %w", err)
+		}
+
+		var claims []types.Claim
+		for rows.Next() {
+			var c types.Claim
+			var metaJSON, tagsJSON string
+			var contradictedBy, forgottenReason sql.NullString
+			var forgottenAt sql.NullInt64
+
+			if err := rows.Scan(
+				&c.ID, &c.TenantID, &c.NamespaceID, &c.CurrentVersion, &c.Content, &c.ContentHash,
+				&c.Confidence, &c.Status, &contradictedBy, &c.WriterID, &c.WriterLabel,
+				&tagsJSON, &c.CreatedAt, &c.UpdatedAt, &forgottenAt, &forgottenReason, &metaJSON,
+			); err != nil {
+				rows.Close()
+				return fmt.Errorf("scanning claim for export: %w", err)
+			}
+
+			if contradictedBy.Valid {
+				c.ContradictedBy = &contradictedBy.String
+			}
+			if forgottenAt.Valid {
+				c.ForgottenAt = &forgottenAt.Int64
+			}
+			if forgottenReason.Valid {
+				c.ForgottenReason = &forgottenReason.String
+			}
+			c.Tags = []string{}
+			if tagsJSON != "" && tagsJSON != "[]" && tagsJSON != "null" {
+				_ = json.Unmarshal([]byte(tagsJSON), &c.Tags)
+			}
+			if metaJSON != "" && metaJSON != "{}" {
+				_ = json.Unmarshal([]byte(metaJSON), &c.Metadata)
+			}
+			claims = append(claims, c)
+			lastID = c.ID
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterating claims for export: %w", err)
+		}
+		rows.Close()
+
+		if len(claims) == 0 {
+			break
+		}
+
+		for _, c := range claims {
+			// Query versions
+			verRows, err := e.db.QueryContext(ctx,
+				`SELECT v.id, v.claim_id, v.tenant_id, v.namespace_id, v.version, v.content, v.confidence, v.contradicts, v.writer_id, v.written_at, v.change_reason, COALESCE(k.label, '')
+				 FROM claim_versions v
+				 LEFT JOIN api_keys k ON v.writer_id = k.id
+				 WHERE v.claim_id = ? ORDER BY v.version ASC`, c.ID)
+			if err != nil {
+				return fmt.Errorf("querying claim versions for export: %w", err)
+			}
+			var versions []types.ClaimVersion
+			for verRows.Next() {
+				var v types.ClaimVersion
+				var contraJSON string
+				var chgReason sql.NullString
+				var writerLabel string
+				if err := verRows.Scan(&v.ID, &v.ClaimID, &v.TenantID, &v.NamespaceID, &v.Version, &v.Content, &v.Confidence, &contraJSON, &v.WriterID, &v.WrittenAt, &chgReason, &writerLabel); err != nil {
+					verRows.Close()
+					return fmt.Errorf("scanning claim version for export: %w", err)
+				}
+				v.Contradicts = []string{}
+				if contraJSON != "" && contraJSON != "[]" && contraJSON != "null" {
+					_ = json.Unmarshal([]byte(contraJSON), &v.Contradicts)
+				}
+				if chgReason.Valid {
+					v.ChangeReason = &chgReason.String
+				}
+				if writerLabel != "" {
+					v.WriterLabel = writerLabel
+				} else {
+					v.WriterLabel = v.WriterID
+				}
+				versions = append(versions, v)
+			}
+			if err := verRows.Err(); err != nil {
+				verRows.Close()
+				return fmt.Errorf("iterating claim versions for export: %w", err)
+			}
+			verRows.Close()
+			if versions == nil {
+				versions = []types.ClaimVersion{}
+			}
+
+			// Query evidence
+			evRows, err := e.db.QueryContext(ctx,
+				`SELECT id, claim_id, claim_version, tenant_id, uri, description, evidence_type, captured_at, metadata
+				 FROM evidence WHERE claim_id = ? ORDER BY claim_version ASC, captured_at ASC`, c.ID)
+			if err != nil {
+				return fmt.Errorf("querying evidence for export: %w", err)
+			}
+			var evidence []types.Evidence
+			for evRows.Next() {
+				var ev types.Evidence
+				var evMeta string
+				if err := evRows.Scan(&ev.ID, &ev.ClaimID, &ev.ClaimVersion, &ev.TenantID, &ev.URI, &ev.Description, &ev.EvidenceType, &ev.CapturedAt, &evMeta); err != nil {
+					evRows.Close()
+					return fmt.Errorf("scanning evidence for export: %w", err)
+				}
+				if evMeta != "" && evMeta != "{}" {
+					_ = json.Unmarshal([]byte(evMeta), &ev.Metadata)
+				}
+				evidence = append(evidence, ev)
+			}
+			if err := evRows.Err(); err != nil {
+				evRows.Close()
+				return fmt.Errorf("iterating evidence for export: %w", err)
+			}
+			evRows.Close()
+			if evidence == nil {
+				evidence = []types.Evidence{}
+			}
+
+			record := types.ClaimsExportRecord{
+				SchemaVersion: "1.0",
+				RecordType:    "claim",
+				Claim:         c,
+				Versions:      versions,
+				Evidence:      evidence,
+			}
+
+			line, err := json.Marshal(record)
+			if err != nil {
+				return fmt.Errorf("marshaling claim export record: %w", err)
+			}
+			if _, err := w.Write(append(line, '\n')); err != nil {
+				return fmt.Errorf("writing claim export line: %w", err)
+			}
+		}
+
+		if len(claims) < batchSize {
+			break
+		}
+	}
+
+	return nil
 }

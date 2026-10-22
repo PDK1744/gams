@@ -102,16 +102,23 @@ func TestSSEAuth(t *testing.T) {
 		t.Errorf("expected 401 for invalid auth, got %d", w.Code)
 	}
 
-	// 3. Query param auth
+	// 3. Query param auth rejected (CR-003)
 	req = httptest.NewRequest(http.MethodGet, "/mcp/sse?api_key="+apiKey, nil)
-	// Cancel request context immediately after initial response
-	ctx, cancel := context.WithCancel(context.Background())
-	req = req.WithContext(ctx)
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for query param api_key auth, got %d", w.Code)
+	}
 
+	// 4. Valid Authorization Bearer header
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/mcp/sse?api_key="+apiKey, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	httpReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/mcp/sse", nil)
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
 		t.Fatalf("connecting to SSE: %v", err)

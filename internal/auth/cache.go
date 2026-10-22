@@ -91,6 +91,21 @@ func (c *LRUCache[K, V]) Delete(key K) {
 	}
 }
 
+// DeleteWhere iterates over all entries and removes entries that match the predicate.
+func (c *LRUCache[K, V]) DeleteWhere(predicate func(key K, value V) bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for elem := c.evictList.Front(); elem != nil; {
+		next := elem.Next()
+		entry := elem.Value.(*cacheEntry[K, V])
+		if predicate(entry.key, entry.value) {
+			c.removeEntry(entry)
+		}
+		elem = next
+	}
+}
+
 // Clear flushes all entries from the cache.
 func (c *LRUCache[K, V]) Clear() {
 	c.mu.Lock()

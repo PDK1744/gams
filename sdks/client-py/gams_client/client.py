@@ -4,7 +4,11 @@ Provides AsyncGAMSClient (asyncio-first) and GAMSClient (sync wrapper).
 """
 
 import asyncio
+import hashlib
+import hmac
+import json
 import threading
+import time
 from typing import Any, List, Optional, Union
 import urllib.parse
 
@@ -42,6 +46,7 @@ class AsyncGAMSClient:
         timeout: float = 30.0,
         retry_policy: Optional[RetryPolicy] = None,
         http_client: Optional[httpx.AsyncClient] = None,
+        sign_requests: bool = False,
     ) -> None:
         if not api_key:
             raise ValidationError("AsyncGAMSClient requires a non-empty api_key")
@@ -50,6 +55,7 @@ class AsyncGAMSClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.retry_policy = retry_policy
+        self.sign_requests = sign_requests
 
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
@@ -68,14 +74,28 @@ class AsyncGAMSClient:
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/json",
         }
+        body_bytes: Optional[bytes] = None
         if json_body is not None:
             headers["Content-Type"] = "application/json"
+            body_bytes = json.dumps(json_body).encode("utf-8")
+
+        if self.sign_requests:
+            timestamp = str(int(time.time()))
+            body_hash = hashlib.sha256(body_bytes or b"").hexdigest()
+            canonical = f"{method.upper()}\n{url}\n{timestamp}\n{body_hash}"
+            signature = hmac.new(
+                self.api_key.encode("utf-8"),
+                canonical.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            headers["X-GAMS-Timestamp"] = timestamp
+            headers["X-GAMS-Signature"] = signature
 
         try:
             response = await self._client.request(
                 method=method,
                 url=url,
-                json=json_body,
+                content=body_bytes,
                 headers=headers,
             )
         except httpx.TimeoutException as err:
@@ -334,6 +354,7 @@ class GAMSClient:
         base_url: str = "http://127.0.0.1:8080",
         timeout: float = 30.0,
         retry_policy: Optional[RetryPolicy] = None,
+        sign_requests: bool = False,
     ) -> None:
         if not api_key:
             raise ValidationError("GAMSClient requires a non-empty api_key")
@@ -346,6 +367,7 @@ class GAMSClient:
                 base_url=base_url,
                 timeout=timeout,
                 retry_policy=retry_policy,
+                sign_requests=sign_requests,
             )
 
         self._async_client = self._loop_thread.run(_init_client())

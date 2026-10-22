@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 
 var (
 	// Version is populated at build time via -ldflags="-X 'main.Version=...'"
-	Version = "0.1.0"
+	Version = "1.0.0"
 )
 
 func main() {
@@ -78,10 +79,14 @@ func run(args []string) error {
 		apiKey = os.Getenv("GAMS_API_KEY")
 	}
 
-	isDev := *devMode || os.Getenv("GAMS_DEV") == "true" || os.Getenv("GAMS_ENV") == "development"
-	if cfg.Server.AdminKey == "" {
+	if strings.ToLower(os.Getenv("GAMS_ENV")) == "production" && strings.TrimSpace(cfg.Server.AdminKey) == "" {
+		return fmt.Errorf("fatal: server.admin_key must be configured when GAMS_ENV=production")
+	}
+
+	isDev := *devMode || os.Getenv("GAMS_UNSAFE_DEVMODE") == "true" || os.Getenv("GAMS_DEV") == "true"
+	if strings.TrimSpace(cfg.Server.AdminKey) == "" {
 		if isDev {
-			logger.Warn("running in development mode with empty server.admin_key; administrative endpoints are unauthenticated")
+			logger.Error("SECURITY WARNING: GAMS is running in UNSAFE DEVELOPMENT MODE with an empty admin key; administrative endpoints are unauthenticated!")
 		} else {
 			logger.Warn("server.admin_key is not set; running with empty admin key. For production, set an admin key or use --dev for local testing")
 		}

@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/PDK1744/gams/internal/metrics"
 	"github.com/PDK1744/gams/pkg/types"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -83,6 +84,13 @@ func (s *Service) InvalidateKeyCache(rawKey string) {
 	s.cache.Delete(cacheKey)
 }
 
+// InvalidateTenantCache removes all cached identities belonging to the specified tenant.
+func (s *Service) InvalidateTenantCache(tenantID string) {
+	s.cache.DeleteWhere(func(key string, identity *CachedIdentity) bool {
+		return identity != nil && identity.Tenant != nil && identity.Tenant.ID == tenantID
+	})
+}
+
 // ClearCache clears all cached keys.
 func (s *Service) ClearCache() {
 	s.cache.Clear()
@@ -99,6 +107,7 @@ func (s *Service) VerifyAPIKey(ctx context.Context, rawKey string) (*types.APIKe
 	cacheKey := hex.EncodeToString(h[:])
 
 	if cached, ok := s.cache.Get(cacheKey); ok {
+		metrics.Default().RecordAuthCacheHit()
 		// Verify tenant and key status from cached identity
 		if cached.APIKey.Status != "active" {
 			s.cache.Delete(cacheKey)
@@ -115,6 +124,8 @@ func (s *Service) VerifyAPIKey(ctx context.Context, rawKey string) (*types.APIKe
 		s.maybeRecordKeyUsage(cached)
 		return cached.APIKey, cached.Tenant, nil
 	}
+
+	metrics.Default().RecordAuthCacheMiss()
 
 	// Reject immediately if the key does not follow the structured gams_<tenant_id>_<token> format.
 	// This prevents unauthenticated clients from triggering cross-tenant database scans and CPU-heavy bcrypt comparisons.

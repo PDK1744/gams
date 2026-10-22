@@ -1,10 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -72,6 +74,41 @@ func (h *Handler) authMiddleware(next http.Handler) http.Handler {
 			}
 			writeError(w, http.StatusUnauthorized, "invalid API key")
 			return
+		}
+
+		// Enforce or verify request signing if required or signature headers are provided
+		var bodyBytes []byte
+		if r.Body != nil {
+			var err error
+			bodyBytes, err = io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes))
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "reading request body: "+err.Error())
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
+		timestamp := r.Header.Get(auth.HeaderTimestamp)
+		signature := r.Header.Get(auth.HeaderSignature)
+
+		if h.eng.Config().Auth.SigningRequired || signature != "" {
+			reqURI := r.URL.RequestURI()
+			if reqURI == "" {
+				reqURI = r.URL.Path
+			}
+			err := auth.VerifySignature(rawKey, r.Method, reqURI, timestamp, signature, bodyBytes)
+			if err != nil && r.URL.Path != reqURI {
+				// Retry with URL path if RequestURI failed (e.g. client signed path without query)
+				err = auth.VerifySignature(rawKey, r.Method, r.URL.Path, timestamp, signature, bodyBytes)
+			}
+			if err != nil {
+				if errors.Is(err, auth.ErrTimestampExpired) {
+					writeError(w, http.StatusUnauthorized, "request timestamp expired or invalid")
+					return
+				}
+				writeError(w, http.StatusUnauthorized, "invalid or missing request signature")
+				return
+			}
 		}
 
 		ctx := context.WithValue(r.Context(), apiKeyCtxKey, apiKey)

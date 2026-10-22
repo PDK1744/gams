@@ -35,6 +35,11 @@ max_evidence_per_claim = 20
 # Default limit for recall queries if omitted by the caller
 default_recall_limit = 10
 
+# In-memory token bucket rate limiting per API key
+rate_limit_enabled = true
+rate_limit_rps = 100
+rate_limit_burst = 200
+
 [auth]
 # Whether HMAC-SHA256 request signing is enforced
 signing_required = false

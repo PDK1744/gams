@@ -156,3 +156,30 @@ test('GAMSClient ensureNamespace returns existing namespace or creates new one',
     await mock.close();
   }
 });
+
+test('GAMSClient signs requests with X-GAMS-Timestamp and X-GAMS-Signature', async () => {
+  let receivedTimestamp = '';
+  let receivedSignature = '';
+
+  const mock = await createMockServer((req, res) => {
+    receivedTimestamp = req.headers['x-gams-timestamp'];
+    receivedSignature = req.headers['x-gams-signature'];
+    res.setHeader('Content-Type', 'application/json');
+    res.writeHead(200);
+    res.end(JSON.stringify({ claims: [], total_matched: 0 }));
+  });
+
+  try {
+    const client = new GAMSClient({
+      baseUrl: mock.baseUrl,
+      apiKey: 'secret-key-123',
+      signRequests: true,
+    });
+
+    await client.recall({ query: 'hello' });
+    assert.ok(receivedTimestamp.length > 0, 'missing timestamp header');
+    assert.ok(receivedSignature.length === 64, 'signature should be 64-char hex');
+  } finally {
+    await mock.close();
+  }
+});

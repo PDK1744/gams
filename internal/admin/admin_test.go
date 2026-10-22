@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/PDK1744/gams/internal/config"
@@ -282,13 +283,97 @@ func TestAdminAuditEndpoints(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &tenant)
 
 	// Query tenant audit
-	rec = doRequest(srv, http.MethodGet, "/admin/tenants/"+tenant.ID+"/audit", adminKey, nil)
+	rec = doRequest(srv, http.MethodGet, "/admin/tenants/"+tenant.ID+"/audit?limit=200", adminKey, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if pageLimit := rec.Header().Get("X-Page-Limit"); pageLimit != "100" {
+		t.Fatalf("expected X-Page-Limit=100 when requested 200, got %s", pageLimit)
+	}
+	if hasMore := rec.Header().Get("X-Has-More"); hasMore != "false" {
+		t.Fatalf("expected X-Has-More=false, got %s", hasMore)
 	}
 	var events []types.AuditEvent
 	_ = json.Unmarshal(rec.Body.Bytes(), &events)
 	if len(events) < 2 { // TENANT_CREATED and NAMESPACE_CREATED for default
 		t.Fatalf("expected at least 2 audit events, got %d", len(events))
+	}
+}
+
+func TestAdminExportEndpoints(t *testing.T) {
+	srv, adminKey := setupTestServer(t)
+	ctx := context.Background()
+
+	// 1. Create tenant and key
+	tResp, _ := srv.Engine().CreateTenant(ctx, &types.CreateTenantRequest{Name: "Export Corp"}, "admin", "admin")
+	kResp, _ := srv.Engine().CreateAPIKey(ctx, tResp.ID, &types.CreateAPIKeyRequest{Label: "exporter"}, "admin", "admin")
+
+	apiKey := &types.APIKey{ID: kResp.ID, TenantID: tResp.ID, Label: kResp.Label, Status: kResp.Status}
+	_, err := srv.Engine().Remember(ctx, apiKey, tResp, &types.RememberRequest{
+		Content:    "Exportable claim statement",
+		Confidence: 0.85,
+		Evidence: []types.EvidenceInput{
+			{URI: "doc://export", Description: "Export verification item", EvidenceType: "file"},
+		},
+		Tags: []string{"backup", "export"},
+	})
+	if err != nil {
+		t.Fatalf("remember failed: %v", err)
+	}
+
+	// 2. Audit Export
+	rec := doRequest(srv, http.MethodGet, "/admin/tenants/"+tResp.ID+"/audit/export", adminKey, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from audit export, got %d: %s", rec.Code, rec.Body.String())
+	}
+	auditLines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(auditLines) == 0 {
+		t.Fatalf("expected non-empty audit export lines")
+	}
+	for i, line := range auditLines {
+		var record types.AuditExportRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("unmarshaling audit export line %d: %v", i, err)
+		}
+		if record.SchemaVersion != "1.0" {
+			t.Errorf("line %d: expected schema_version 1.0, got %q", i, record.SchemaVersion)
+		}
+		if record.Event.TenantID != tResp.ID {
+			t.Errorf("line %d: expected tenant %s, got %s", i, tResp.ID, record.Event.TenantID)
+		}
+	}
+
+	// 3. Claims Snapshot Export
+	rec = doRequest(srv, http.MethodGet, "/admin/tenants/"+tResp.ID+"/claims/export", adminKey, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from claims export, got %d: %s", rec.Code, rec.Body.String())
+	}
+	claimLines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(claimLines) < 2 {
+		t.Fatalf("expected at least header + 1 claim record, got %d lines", len(claimLines))
+	}
+
+	// First line must be header
+	var header types.ClaimsExportHeader
+	if err := json.Unmarshal([]byte(claimLines[0]), &header); err != nil {
+		t.Fatalf("unmarshaling header line: %v", err)
+	}
+	if header.SchemaVersion != "1.0" || header.RecordType != "header" || header.ClaimsCount != 1 {
+		t.Fatalf("unexpected header record: %+v", header)
+	}
+
+	// Second line must be claim
+	var claimRec types.ClaimsExportRecord
+	if err := json.Unmarshal([]byte(claimLines[1]), &claimRec); err != nil {
+		t.Fatalf("unmarshaling claim line: %v", err)
+	}
+	if claimRec.SchemaVersion != "1.0" || claimRec.RecordType != "claim" {
+		t.Fatalf("unexpected claim record: %+v", claimRec)
+	}
+	if claimRec.Claim.Content != "Exportable claim statement" {
+		t.Errorf("expected claim content 'Exportable claim statement', got %q", claimRec.Claim.Content)
+	}
+	if len(claimRec.Versions) != 1 || len(claimRec.Evidence) != 1 {
+		t.Errorf("expected 1 version and 1 evidence, got %d versions, %d evidence", len(claimRec.Versions), len(claimRec.Evidence))
 	}
 }

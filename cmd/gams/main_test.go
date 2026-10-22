@@ -138,6 +138,18 @@ key_cache_ttl_seconds = 300
 	if err == nil {
 		t.Fatalf("expected error for non-existent claim, got nil")
 	}
+
+	// 4. Audit Export via Direct DB
+	err = run([]string{"admin", "audit", "export", "--tenant", tenant.ID, "--config", configPath})
+	if err != nil {
+		t.Fatalf("admin audit export direct DB failed: %v", err)
+	}
+
+	// 5. Claims Export via Direct DB
+	err = run([]string{"admin", "claims", "export", "--tenant", tenant.ID, "--config", configPath})
+	if err != nil {
+		t.Fatalf("admin claims export direct DB failed: %v", err)
+	}
 }
 
 func TestRunAdminClaimsInspectRemoteHTTP(t *testing.T) {
@@ -204,6 +216,53 @@ func TestRunAdminClaimsInspectRemoteHTTP(t *testing.T) {
 	err = run([]string{"admin", "claims", "inspect", remRes.ClaimID, "--server", ts.URL, "--admin-key", "adminkey12345", "--format", "json"})
 	if err != nil {
 		t.Fatalf("admin claims inspect via remote server failed: %v", err)
+	}
+
+	// Audit export via HTTP
+	err = run([]string{"admin", "audit", "export", "--tenant", tenant.ID, "--server", ts.URL, "--admin-key", "adminkey12345"})
+	if err != nil {
+		t.Fatalf("admin audit export via remote server failed: %v", err)
+	}
+
+	// Claims export via HTTP
+	err = run([]string{"admin", "claims", "export", "--tenant", tenant.ID, "--server", ts.URL, "--admin-key", "adminkey12345"})
+	if err != nil {
+		t.Fatalf("admin claims export via remote server failed: %v", err)
+	}
+}
+
+func TestRunAdminExportValidation(t *testing.T) {
+	if err := run([]string{"admin", "audit"}); err == nil {
+		t.Fatalf("expected error for admin audit without subcommand")
+	}
+	if err := run([]string{"admin", "audit", "export"}); err == nil {
+		t.Fatalf("expected error for audit export without --tenant")
+	}
+	if err := run([]string{"admin", "claims", "export"}); err == nil {
+		t.Fatalf("expected error for claims export without --tenant")
+	}
+}
+
+func TestProductionModeRequiresAdminKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_prod.db")
+	configPath := filepath.Join(tmpDir, "gams.toml")
+
+	tomlContent := fmt.Sprintf(`
+[server]
+admin_key = ""
+
+[data]
+path = %q
+`, dbPath)
+	if err := os.WriteFile(configPath, []byte(tomlContent), 0644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	t.Setenv("GAMS_ENV", "production")
+	err := run([]string{"serve", "--config", configPath})
+	if err == nil {
+		t.Fatalf("expected error running serve in production with empty admin_key, got nil")
 	}
 }
 

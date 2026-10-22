@@ -257,3 +257,26 @@ def test_sync_client_running_loop_guard():
         asyncio.run(run_inside_loop())
     finally:
         client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_request_signing():
+    captured_headers = {}
+
+    def handler(request: httpx.Request):
+        nonlocal captured_headers
+        captured_headers = dict(request.headers)
+        return httpx.Response(200, json={"claims": [], "total_matched": 0})
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
+    client = AsyncGAMSClient(
+        api_key="secret-token-456",
+        http_client=mock_client,
+        sign_requests=True,
+    )
+
+    await client.recall(query="test-query")
+    assert "x-gams-timestamp" in captured_headers
+    assert "x-gams-signature" in captured_headers
+    assert len(captured_headers["x-gams-signature"]) == 64
+

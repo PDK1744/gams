@@ -57,7 +57,7 @@ class RememberResult(BaseModel):
     claim_id: str
     version: int
     created_at: Union[str, int]
-    status: Union[Literal["created", "updated", "conflict"], str]
+    status: Union[Literal["created", "updated", "conflict", "idempotent"], str]
     conflict: Optional[ConflictInfo] = None
 
 

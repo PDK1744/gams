@@ -131,8 +131,10 @@ func (l *Logger) Query(ctx context.Context, db *sql.DB, f Filter) ([]types.Audit
 	}
 
 	limit := f.Limit
-	if limit <= 0 || limit > 100 {
+	if limit <= 0 {
 		limit = 50
+	} else if limit > 101 {
+		limit = 100
 	}
 
 	query := fmt.Sprintf(`SELECT id, tenant_id, namespace_id, event_type, actor_key_id, actor_label,

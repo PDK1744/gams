@@ -1,3 +1,4 @@
+import { createHash, createHmac } from 'node:crypto';
 import {
   GAMSClientError,
   AuthenticationError,
@@ -24,6 +25,7 @@ export class GAMSClient {
   public readonly apiKey: string;
   public readonly timeoutMs: number;
   public readonly retryPolicy?: GAMSClientOptions['retryPolicy'];
+  public readonly signRequests: boolean;
 
   constructor(options: GAMSClientOptions) {
     if (!options?.apiKey) {
@@ -33,14 +35,28 @@ export class GAMSClient {
     this.apiKey = options.apiKey;
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.retryPolicy = options.retryPolicy;
+    this.signRequests = options.signRequests ?? false;
   }
 
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
-    const url = `${this.baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+    const normPath = path.startsWith('/') ? path : `/${path}`;
+    const url = `${this.baseUrl}${normPath}`;
     const headers = new Headers(options.headers);
     headers.set('Authorization', `Bearer ${this.apiKey}`);
     if (!headers.has('Content-Type') && options.body) {
       headers.set('Content-Type', 'application/json');
+    }
+
+    if (this.signRequests) {
+      const method = (options.method ?? 'GET').toUpperCase();
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const bodyContent = typeof options.body === 'string' ? options.body : '';
+      const bodyHash = createHash('sha256').update(bodyContent).digest('hex');
+      const canonical = `${method}\n${normPath}\n${timestamp}\n${bodyHash}`;
+      const signature = createHmac('sha256', this.apiKey).update(canonical).digest('hex');
+
+      headers.set('X-GAMS-Timestamp', timestamp);
+      headers.set('X-GAMS-Signature', signature);
     }
 
     const controller = new AbortController();

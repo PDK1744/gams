@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -98,6 +99,9 @@ func TestRememberAndIdempotency(t *testing.T) {
 	}
 	if resp2.Version != 1 {
 		t.Fatalf("expected version 1 for idempotent write, got %d", resp2.Version)
+	}
+	if resp2.Status != "idempotent" {
+		t.Fatalf("expected status 'idempotent' for idempotent write, got %s", resp2.Status)
 	}
 }
 
@@ -618,5 +622,96 @@ func TestForgetSoftDelete(t *testing.T) {
 	}
 	if inspectResp.Claim.ForgottenReason == nil || *inspectResp.Claim.ForgottenReason != "decommissioned secret" {
 		t.Fatalf("expected forgotten_reason 'decommissioned secret', got %v", inspectResp.Claim.ForgottenReason)
+	}
+}
+
+func TestConcurrentResolveOrCreateNamespace(t *testing.T) {
+	ctx := context.Background()
+	eng, tenant, apiKey := setupTestEngine(t)
+
+	// Ensure auto_create_namespaces is true
+	autoc := true
+	var err error
+	tenant, err = eng.UpdateTenant(ctx, tenant.ID, &types.UpdateTenantRequest{
+		AutoCreateNamespaces: &autoc,
+	}, "admin", "admin")
+	if err != nil {
+		t.Fatalf("updating tenant: %v", err)
+	}
+
+	const goroutines = 5
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, remErr := eng.Remember(ctx, apiKey, tenant, &types.RememberRequest{
+				Content:    fmt.Sprintf("Concurrent memory %d", idx),
+				Confidence: 0.9,
+				Namespace:  "concurrent-ns-slug",
+				Evidence: []types.EvidenceInput{
+					{URI: "file://test", Description: "Test", EvidenceType: "file"},
+				},
+			})
+			if remErr != nil {
+				errCh <- remErr
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for remErr := range errCh {
+		t.Fatalf("concurrent Remember with new namespace slug failed: %v", remErr)
+	}
+
+	ns, err := eng.GetNamespace(ctx, tenant.ID, "concurrent-ns-slug")
+	if err != nil {
+		t.Fatalf("fetching auto-created namespace: %v", err)
+	}
+	if ns.Slug != "concurrent-ns-slug" {
+		t.Fatalf("expected slug concurrent-ns-slug, got %s", ns.Slug)
+	}
+}
+
+func TestConcurrentEnsureLocalWorkspaceTenant(t *testing.T) {
+	ctx := context.Background()
+	testDB, err := db.Open(ctx, "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("opening test db: %v", err)
+	}
+	defer testDB.Close()
+
+	cfg := config.Default()
+	authSvc := auth.NewService(testDB.DB, "admin", 1*time.Minute)
+	eng := New(testDB, authSvc, cfg, "test-version")
+
+	const goroutines = 4
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key, localTenant, provErr := eng.EnsureLocalWorkspaceTenant(ctx)
+			if provErr != nil {
+				errCh <- provErr
+				return
+			}
+			if key == nil || localTenant == nil || localTenant.ID != "local" {
+				errCh <- fmt.Errorf("unexpected local tenant or key: key=%v, tenant=%v", key, localTenant)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for provErr := range errCh {
+		t.Fatalf("concurrent EnsureLocalWorkspaceTenant failed: %v", provErr)
 	}
 }

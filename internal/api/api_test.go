@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
+	"time"
 
+	"github.com/PDK1744/gams/internal/auth"
 	"github.com/PDK1744/gams/internal/config"
 	"github.com/PDK1744/gams/internal/db"
 	"github.com/PDK1744/gams/internal/server"
@@ -242,3 +245,64 @@ func TestAgentNamespaceEndpoints(t *testing.T) {
 		t.Fatalf("unexpected detail: %+v", detail)
 	}
 }
+
+func TestRequestSigning(t *testing.T) {
+	srv, _, apiKey := setupAgentServer(t)
+
+	// Enable signing_required
+	srv.Engine().Config().Auth.SigningRequired = true
+	t.Cleanup(func() {
+		srv.Engine().Config().Auth.SigningRequired = false
+	})
+
+	body := []byte(`{"query":"test"}`)
+	path := "/v1/recall"
+
+	// 1. Missing signature when required -> 401
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on missing signature, got %d", rec.Code)
+	}
+
+	// 2. Valid signature -> 200
+	nowTs := types.NowNano() / 1e9 // seconds
+	tsStr := string(rune(0))
+	_ = tsStr
+	tsStr = bytes.NewBuffer(nil).String()
+	tsStr = timeNowSecStr()
+	sig := auth.ComputeSignature(apiKey, http.MethodPost, path, tsStr, body)
+
+	req = httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(auth.HeaderTimestamp, tsStr)
+	req.Header.Set(auth.HeaderSignature, sig)
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on valid signature, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 3. Tampered signature -> 401
+	req = httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(auth.HeaderTimestamp, tsStr)
+	req.Header.Set(auth.HeaderSignature, "bad-signature-hex")
+	rec = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on bad signature, got %d", rec.Code)
+	}
+
+	_ = nowTs
+}
+
+func timeNowSecStr() string {
+	return strconv.FormatInt(time.Now().Unix(), 10)
+}
+

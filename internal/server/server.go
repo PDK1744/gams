@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/PDK1744/gams/internal/admin"
@@ -17,6 +18,8 @@ import (
 	"github.com/PDK1744/gams/internal/db"
 	"github.com/PDK1744/gams/internal/engine"
 	"github.com/PDK1744/gams/internal/mcp"
+	"github.com/PDK1744/gams/internal/metrics"
+	"github.com/PDK1744/gams/internal/ratelimit"
 	httptransport "github.com/PDK1744/gams/internal/transport/http"
 	stdiotransport "github.com/PDK1744/gams/internal/transport/stdio"
 	"github.com/PDK1744/gams/pkg/types"
@@ -31,6 +34,7 @@ type Server struct {
 	logger     *slog.Logger
 	engine     *engine.Engine
 	sessionMgr *httptransport.SessionManager
+	limiter    *ratelimit.Limiter
 	devMode    bool
 }
 
@@ -57,7 +61,7 @@ func New(cfg *config.Config, database *db.DB, version string, logger *slog.Logge
 		logger = slog.Default()
 	}
 
-	isDev := os.Getenv("GAMS_DEV") == "true" || os.Getenv("GAMS_ENV") == "development"
+	isDev := os.Getenv("GAMS_UNSAFE_DEVMODE") == "true" || os.Getenv("GAMS_DEV") == "true"
 
 	s := &Server{
 		cfg:     cfg,
@@ -69,6 +73,10 @@ func New(cfg *config.Config, database *db.DB, version string, logger *slog.Logge
 
 	for _, opt := range opts {
 		opt(s)
+	}
+
+	if s.devMode && strings.TrimSpace(s.cfg.Server.AdminKey) == "" {
+		s.logger.Error("SECURITY WARNING: GAMS is running in UNSAFE DEVELOPMENT MODE with an empty admin key; administrative endpoints are unauthenticated!")
 	}
 
 	// Initialize Auth, Engine, and Handlers
@@ -85,6 +93,7 @@ func New(cfg *config.Config, database *db.DB, version string, logger *slog.Logge
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	adminHandler.RegisterRoutes(mux)
 	apiHandler.RegisterRoutes(mux)
 
@@ -93,6 +102,10 @@ func New(cfg *config.Config, database *db.DB, version string, logger *slog.Logge
 		s.sessionMgr = httptransport.NewSessionManager(30 * time.Minute)
 		mcpHandler := httptransport.NewHandler(eng, mcpDispatcher, s.sessionMgr, authSvc, s.logger)
 		mcpHandler.RegisterRoutes(mux)
+	}
+
+	if cfg.Limits.RateLimitEnabled {
+		s.limiter = ratelimit.NewLimiter(cfg.Limits.RateLimitRPS, cfg.Limits.RateLimitBurst)
 	}
 
 	s.httpServer = &http.Server{
@@ -113,7 +126,57 @@ func (s *Server) Engine() *engine.Engine {
 }
 
 func (s *Server) wrapMiddleware(handler http.Handler) http.Handler {
-	return s.recoverMiddleware(s.loggingMiddleware(s.corsMiddleware(handler)))
+	return s.recoverMiddleware(s.loggingMiddleware(s.corsMiddleware(s.rateLimitMiddleware(s.writeTimeoutMiddleware(handler)))))
+}
+
+func (s *Server) writeTimeoutMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Non-SSE handlers receive an explicit 30s write deadline to protect against slow clients (CR-007)
+		if r.URL.Path != "/mcp/sse" && !strings.HasSuffix(r.URL.Path, "/export") {
+			rc := http.NewResponseController(w)
+			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			defer func() {
+				_ = rc.SetWriteDeadline(time.Time{})
+			}()
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.limiter == nil || !s.cfg.Limits.RateLimitEnabled {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Bypass rate limiting for internal health checks only (metrics is rate limited)
+		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		key := r.Header.Get("Authorization")
+		if key == "" {
+			key = r.Header.Get("Mcp-Session-Id")
+		}
+		if key == "" {
+			key = r.RemoteAddr
+		}
+
+		if !s.limiter.Allow(key) {
+			metrics.Default().RecordRateLimitExceeded()
+			w.Header().Set("Retry-After", "1")
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "rate_limit_exceeded",
+			})
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
@@ -222,6 +285,35 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	// Verify admin authentication if admin key is configured (query token rejected to prevent proxy log leakage - CR-004)
+	if s.engine.Auth().AdminKeyConfigured() {
+		token := ""
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+		if !s.engine.Auth().VerifyAdminKey(token) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized: valid admin key required for metrics in Authorization header"})
+			return
+		}
+	}
+
+	out, err := metrics.Default().Render(r.Context(), s.db.DB)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "rendering metrics"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(out))
+}
+
 // Start begins listening on the configured HTTP port.
 func (s *Server) Start() error {
 	s.logger.Info("starting HTTP server",
@@ -241,6 +333,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down HTTP server")
 	if s.sessionMgr != nil {
 		s.sessionMgr.Close()
+	}
+	if s.limiter != nil {
+		s.limiter.Stop()
 	}
 	return s.httpServer.Shutdown(ctx)
 }

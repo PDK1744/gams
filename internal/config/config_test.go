@@ -98,6 +98,9 @@ func TestEnvOverrides(t *testing.T) {
 	t.Setenv("GAMS_SERVER_HTTP_PORT", "7070")
 	t.Setenv("GAMS_MCP_TRANSPORT", "stdio")
 	t.Setenv("GAMS_AUTH_SIGNING_REQUIRED", "true")
+	t.Setenv("GAMS_LIMITS_RATE_LIMIT_ENABLED", "false")
+	t.Setenv("GAMS_LIMITS_RATE_LIMIT_RPS", "250")
+	t.Setenv("GAMS_LIMITS_RATE_LIMIT_BURST", "500")
 
 	cfg, err := config.Load("")
 	if err != nil {
@@ -118,6 +121,15 @@ func TestEnvOverrides(t *testing.T) {
 	}
 	if !cfg.Auth.SigningRequired {
 		t.Errorf("expected auth signing true")
+	}
+	if cfg.Limits.RateLimitEnabled {
+		t.Errorf("expected rate_limit_enabled false, got true")
+	}
+	if cfg.Limits.RateLimitRPS != 250 {
+		t.Errorf("expected rate_limit_rps 250, got %d", cfg.Limits.RateLimitRPS)
+	}
+	if cfg.Limits.RateLimitBurst != 500 {
+		t.Errorf("expected rate_limit_burst 500, got %d", cfg.Limits.RateLimitBurst)
 	}
 }
 
@@ -178,6 +190,22 @@ func TestValidationErrors(t *testing.T) {
 			name: "negative claim size",
 			mutate: func(c *config.Config) {
 				c.Limits.MaxClaimSizeBytes = -1
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid rate limit rps",
+			mutate: func(c *config.Config) {
+				c.Limits.RateLimitEnabled = true
+				c.Limits.RateLimitRPS = 0
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid rate limit burst",
+			mutate: func(c *config.Config) {
+				c.Limits.RateLimitEnabled = true
+				c.Limits.RateLimitBurst = -5
 			},
 			wantErr: true,
 		},

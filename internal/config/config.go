@@ -35,9 +35,12 @@ type MCPConfig struct {
 }
 
 type LimitsConfig struct {
-	MaxClaimSizeBytes   int `toml:"max_claim_size_bytes"`
-	MaxEvidencePerClaim int `toml:"max_evidence_per_claim"`
-	DefaultRecallLimit  int `toml:"default_recall_limit"`
+	MaxClaimSizeBytes   int  `toml:"max_claim_size_bytes"`
+	MaxEvidencePerClaim int  `toml:"max_evidence_per_claim"`
+	DefaultRecallLimit  int  `toml:"default_recall_limit"`
+	RateLimitEnabled    bool `toml:"rate_limit_enabled"`
+	RateLimitRPS        int  `toml:"rate_limit_rps"`
+	RateLimitBurst      int  `toml:"rate_limit_burst"`
 }
 
 type AuthConfig struct {
@@ -64,6 +67,9 @@ func Default() *Config {
 			MaxClaimSizeBytes:   65536,
 			MaxEvidencePerClaim: 20,
 			DefaultRecallLimit:  10,
+			RateLimitEnabled:    true,
+			RateLimitRPS:        100,
+			RateLimitBurst:      200,
 		},
 		Auth: AuthConfig{
 			SigningRequired:    false,
@@ -153,6 +159,30 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Limits.DefaultRecallLimit = limit
 	}
+	if val := os.Getenv("GAMS_LIMITS_RATE_LIMIT_ENABLED"); val != "" {
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "true", "1", "yes":
+			cfg.Limits.RateLimitEnabled = true
+		case "false", "0", "no":
+			cfg.Limits.RateLimitEnabled = false
+		default:
+			return fmt.Errorf("invalid GAMS_LIMITS_RATE_LIMIT_ENABLED %q: must be boolean", val)
+		}
+	}
+	if val := os.Getenv("GAMS_LIMITS_RATE_LIMIT_RPS"); val != "" {
+		rps, err := strconv.Atoi(val)
+		if err != nil {
+			return fmt.Errorf("invalid GAMS_LIMITS_RATE_LIMIT_RPS %q: must be integer", val)
+		}
+		cfg.Limits.RateLimitRPS = rps
+	}
+	if val := os.Getenv("GAMS_LIMITS_RATE_LIMIT_BURST"); val != "" {
+		burst, err := strconv.Atoi(val)
+		if err != nil {
+			return fmt.Errorf("invalid GAMS_LIMITS_RATE_LIMIT_BURST %q: must be integer", val)
+		}
+		cfg.Limits.RateLimitBurst = burst
+	}
 	if val := os.Getenv("GAMS_AUTH_SIGNING_REQUIRED"); val != "" {
 		switch strings.ToLower(strings.TrimSpace(val)) {
 		case "true", "1", "yes":
@@ -194,6 +224,14 @@ func (c *Config) Validate() error {
 	}
 	if c.Limits.DefaultRecallLimit <= 0 {
 		return errors.New("limits.default_recall_limit must be greater than 0")
+	}
+	if c.Limits.RateLimitEnabled {
+		if c.Limits.RateLimitRPS <= 0 {
+			return errors.New("limits.rate_limit_rps must be greater than 0 when rate limiting is enabled")
+		}
+		if c.Limits.RateLimitBurst <= 0 {
+			return errors.New("limits.rate_limit_burst must be greater than 0 when rate limiting is enabled")
+		}
 	}
 	if c.Auth.KeyCacheTTLSeconds <= 0 {
 		return errors.New("auth.key_cache_ttl_seconds must be greater than 0")

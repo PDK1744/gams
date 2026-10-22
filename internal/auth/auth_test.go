@@ -319,3 +319,59 @@ func TestAPIKeyExpiration(t *testing.T) {
 		t.Fatalf("expected expired cached key to return ErrInvalidAPIKey, got: %v", err)
 	}
 }
+
+func TestInvalidateTenantCache(t *testing.T) {
+	testDB := setupTestDB(t)
+	ctx := context.Background()
+	svc := NewService(testDB.DB, "admin", 1*time.Minute)
+
+	tA := types.NewUUIDv7()
+	tB := types.NewUUIDv7()
+	now := types.NowNano()
+
+	_, _ = testDB.ExecContext(ctx, `INSERT INTO tenants (id, name, status, recall_decay_lambda, max_claims, auto_create_namespaces, created_at, metadata) VALUES (?, 'Tenant A', 'active', 0.05, 0, 0, ?, '{}')`, tA, now)
+	_, _ = testDB.ExecContext(ctx, `INSERT INTO tenants (id, name, status, recall_decay_lambda, max_claims, auto_create_namespaces, created_at, metadata) VALUES (?, 'Tenant B', 'active', 0.05, 0, 0, ?, '{}')`, tB, now)
+
+	keyA, hashA, err := GenerateAPIKey(tA)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey A: %v", err)
+	}
+	keyB, hashB, err := GenerateAPIKey(tB)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey B: %v", err)
+	}
+
+	_, _ = testDB.ExecContext(ctx, `INSERT INTO api_keys (id, tenant_id, key_hash, label, status, last_used_at, expires_at, created_at) VALUES ('kA', ?, ?, 'kA', 'active', 0, NULL, ?)`, tA, hashA, now)
+	_, _ = testDB.ExecContext(ctx, `INSERT INTO api_keys (id, tenant_id, key_hash, label, status, last_used_at, expires_at, created_at) VALUES ('kB', ?, ?, 'kB', 'active', 0, NULL, ?)`, tB, hashB, now)
+
+	// Populate cache for both
+	_, _, err = svc.VerifyAPIKey(ctx, keyA)
+	if err != nil {
+		t.Fatalf("verify A failed: %v", err)
+	}
+	_, _, err = svc.VerifyAPIKey(ctx, keyB)
+	if err != nil {
+		t.Fatalf("verify B failed: %v", err)
+	}
+
+	// Invalidate tenant A only
+	svc.InvalidateTenantCache(tA)
+
+	// Tenant A key hash removed in DB to prove cache miss requires re-querying DB
+	_, _ = testDB.ExecContext(ctx, `UPDATE api_keys SET status = 'revoked' WHERE id = 'kA'`)
+	_, _, err = svc.VerifyAPIKey(ctx, keyA)
+	if err != ErrInvalidAPIKey {
+		t.Fatalf("expected tenant A to miss cache and see revoked status, got %v", err)
+	}
+
+	// Tenant B should still be in cache (even if we temporarily break DB connection, or change status)
+	// Changing DB status to revoked without clearing cache would still hit cache:
+	_, _ = testDB.ExecContext(ctx, `UPDATE api_keys SET status = 'revoked' WHERE id = 'kB'`)
+	kRecB, _, err := svc.VerifyAPIKey(ctx, keyB)
+	if err != nil {
+		t.Fatalf("expected tenant B to hit cache, got %v", err)
+	}
+	if kRecB.ID != "kB" {
+		t.Fatalf("expected cached key B")
+	}
+}

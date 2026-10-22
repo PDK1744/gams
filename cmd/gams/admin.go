@@ -32,6 +32,8 @@ func runAdmin(args []string) error {
 		return nil
 	case "claims":
 		return runAdminClaims(args[1:])
+	case "audit":
+		return runAdminAudit(args[1:])
 	default:
 		return fmt.Errorf("unknown admin command %q; run 'gams admin help' for usage", args[0])
 	}
@@ -45,25 +47,44 @@ Usage:
 
 Commands:
   claims inspect <claim-id>   Inspect a claim's full governance history, versions, evidence, and audit trail
+  claims export --tenant <id> Export full claims snapshot (all versions, evidence) as JSONL with schema_version: 1.0
+  audit export --tenant <id>  Export chronological audit log as JSONL with mandatory schema_version: 1.0
 
 Options:
+  --tenant <id>               Tenant UUID (required for export commands)
+  --namespace <slug>          Optional namespace slug filter
   --config <path>             Path to gams.toml config file (default: gams.toml)
-  --format <text|json>        Output format: text | json (default: text)
-  --server <url>              GAMS server base URL (optional; if omitted, inspects local database directly)
+  --format <text|json|jsonl>  Output format: text | json | jsonl (default: text for inspect, jsonl for export)
+  --server <url>              GAMS server base URL (optional; if omitted, queries local database directly)
   --admin-key <key>           Admin API key for remote server queries
 `)
 }
 
 func runAdminClaims(args []string) error {
 	if len(args) == 0 {
-		return errors.New("missing claims subcommand; e.g. 'gams admin claims inspect <claim-id>'")
+		return errors.New("missing claims subcommand; e.g. 'gams admin claims inspect <claim-id>' or 'gams admin claims export --tenant <id>'")
 	}
 
 	switch args[0] {
 	case "inspect":
 		return runAdminClaimsInspect(args[1:])
+	case "export":
+		return runAdminClaimsExport(args[1:])
 	default:
 		return fmt.Errorf("unknown claims subcommand %q; see 'gams admin help'", args[0])
+	}
+}
+
+func runAdminAudit(args []string) error {
+	if len(args) == 0 {
+		return errors.New("missing audit subcommand; e.g. 'gams admin audit export --tenant <id>'")
+	}
+
+	switch args[0] {
+	case "export":
+		return runAdminAuditExport(args[1:])
+	default:
+		return fmt.Errorf("unknown audit subcommand %q; see 'gams admin help'", args[0])
 	}
 }
 
@@ -301,4 +322,145 @@ func renderInspectHumanReadable(w io.Writer, resp *types.InspectResponse) {
 		}
 	}
 	fmt.Fprintf(w, "================================================================================\n")
+}
+
+func runAdminAuditExport(args []string) error {
+	fs := flag.NewFlagSet("audit export", flag.ContinueOnError)
+	tenantID := fs.String("tenant", "", "tenant UUID (required)")
+	namespace := fs.String("namespace", "", "namespace slug (optional)")
+	format := fs.String("format", "jsonl", "output format (default: jsonl)")
+	configPath := fs.String("config", "gams.toml", "path to configuration file")
+	serverURL := fs.String("server", "", "GAMS server base URL (optional; queries local DB if empty)")
+	adminKey := fs.String("admin-key", "", "GAMS admin key (optional)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *tenantID == "" {
+		return errors.New("missing required flag: --tenant <id>\nUsage: gams admin audit export --tenant <id> [--namespace <slug>] [--format jsonl]")
+	}
+
+	var nsSlug *string
+	if *namespace != "" {
+		nsSlug = namespace
+	}
+
+	if *serverURL != "" {
+		path := fmt.Sprintf("/admin/tenants/%s/audit/export?format=%s", *tenantID, *format)
+		if nsSlug != nil {
+			path += "&namespace=" + *nsSlug
+		}
+		return exportViaHTTP(*serverURL, *adminKey, path)
+	}
+
+	return exportAuditViaDirectDB(*configPath, *tenantID, nsSlug)
+}
+
+func runAdminClaimsExport(args []string) error {
+	fs := flag.NewFlagSet("claims export", flag.ContinueOnError)
+	tenantID := fs.String("tenant", "", "tenant UUID (required)")
+	namespace := fs.String("namespace", "", "namespace slug (optional)")
+	configPath := fs.String("config", "gams.toml", "path to configuration file")
+	serverURL := fs.String("server", "", "GAMS server base URL (optional; queries local DB if empty)")
+	adminKey := fs.String("admin-key", "", "GAMS admin key (optional)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *tenantID == "" {
+		return errors.New("missing required flag: --tenant <id>\nUsage: gams admin claims export --tenant <id> [--namespace <slug>]")
+	}
+
+	var nsSlug *string
+	if *namespace != "" {
+		nsSlug = namespace
+	}
+
+	if *serverURL != "" {
+		path := fmt.Sprintf("/admin/tenants/%s/claims/export", *tenantID)
+		if nsSlug != nil {
+			path += "?namespace=" + *nsSlug
+		}
+		return exportViaHTTP(*serverURL, *adminKey, path)
+	}
+
+	return exportClaimsViaDirectDB(*configPath, *tenantID, nsSlug)
+}
+
+func exportAuditViaDirectDB(configPath, tenantID string, nsSlug *string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("loading config %q: %w", configPath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	database, err := db.Open(ctx, cfg.Data.Path)
+	if err != nil {
+		return fmt.Errorf("opening database at %q: %w", cfg.Data.Path, err)
+	}
+	defer database.Close()
+
+	authSvc := auth.NewService(database.DB, cfg.Server.AdminKey, 300*time.Second)
+	eng := engine.New(database, authSvc, cfg, Version)
+
+	return eng.ExportAudit(ctx, tenantID, nsSlug, os.Stdout)
+}
+
+func exportClaimsViaDirectDB(configPath, tenantID string, nsSlug *string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("loading config %q: %w", configPath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	database, err := db.Open(ctx, cfg.Data.Path)
+	if err != nil {
+		return fmt.Errorf("opening database at %q: %w", cfg.Data.Path, err)
+	}
+	defer database.Close()
+
+	authSvc := auth.NewService(database.DB, cfg.Server.AdminKey, 300*time.Second)
+	eng := engine.New(database, authSvc, cfg, Version)
+
+	return eng.ExportClaims(ctx, tenantID, nsSlug, os.Stdout)
+}
+
+func exportViaHTTP(serverURL, adminKey, path string) error {
+	url := strings.TrimRight(serverURL, "/") + path
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("creating export http request: %w", err)
+	}
+	if adminKey != "" {
+		req.Header.Set("Authorization", "Bearer "+adminKey)
+	} else if envKey := os.Getenv("GAMS_ADMIN_KEY"); envKey != "" {
+		req.Header.Set("Authorization", "Bearer "+envKey)
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("connecting to server %s: %w", serverURL, err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(res.Body)
+		var errObj struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(body, &errObj) == nil && errObj.Error != "" {
+			return fmt.Errorf("server error (%d): %s", res.StatusCode, errObj.Error)
+		}
+		return fmt.Errorf("server returned HTTP %d: %s", res.StatusCode, string(body))
+	}
+
+	_, err = io.Copy(os.Stdout, res.Body)
+	return err
 }

@@ -46,19 +46,17 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 // HandleSSE establishes a persistent Server-Sent Events stream for an MCP client session.
 func (h *Handler) HandleSSE(w http.ResponseWriter, r *http.Request) {
-	// 1. Authenticate via Bearer header or api_key query parameter
+	// 1. Authenticate via Bearer header exclusively (query parameter auth rejected to prevent proxy log leakage - CR-003)
 	rawKey := ""
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		rawKey = strings.TrimPrefix(authHeader, "Bearer ")
-	} else if paramKey := r.URL.Query().Get("api_key"); paramKey != "" {
-		rawKey = paramKey
 	}
 
 	if rawKey == "" {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized: api key required"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized: Bearer API key required in Authorization header"})
 		return
 	}
 

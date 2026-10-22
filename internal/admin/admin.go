@@ -57,6 +57,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// Audit
 	mux.Handle("GET /admin/tenants/{id}/audit", adminAuth(http.HandlerFunc(h.handleTenantAudit)))
 	mux.Handle("GET /admin/tenants/{id}/namespaces/{slug}/audit", adminAuth(http.HandlerFunc(h.handleNamespaceAudit)))
+
+	// Exports (Phase 5, Decision Q7)
+	mux.Handle("GET /admin/tenants/{id}/audit/export", adminAuth(http.HandlerFunc(h.handleExportAudit)))
+	mux.Handle("GET /admin/tenants/{id}/claims/export", adminAuth(http.HandlerFunc(h.handleExportClaims)))
 }
 
 func (h *Handler) authMiddleware(next http.Handler) http.Handler {
@@ -324,11 +328,27 @@ func (h *Handler) handleTenantAudit(w http.ResponseWriter, r *http.Request) {
 		claimIDPtr = &cID
 	}
 
-	events, err := h.eng.Audit().Query(r.Context(), h.eng.DB().DB, engine.AuditFilter(tenantID, nsIDPtr, claimIDPtr, eventTypePtr, sincePtr, untilPtr, limit, offset))
+	effLimit := limit
+	if effLimit <= 0 {
+		effLimit = 50
+	} else if effLimit > 100 {
+		effLimit = 100
+	}
+
+	events, err := h.eng.Audit().Query(r.Context(), h.eng.DB().DB, engine.AuditFilter(tenantID, nsIDPtr, claimIDPtr, eventTypePtr, sincePtr, untilPtr, effLimit+1, offset))
 	if err != nil {
 		handleError(w, err)
 		return
 	}
+
+	hasMore := false
+	if len(events) > effLimit {
+		hasMore = true
+		events = events[:effLimit]
+	}
+
+	w.Header().Set("X-Has-More", strconv.FormatBool(hasMore))
+	w.Header().Set("X-Page-Limit", strconv.Itoa(effLimit))
 	writeJSON(w, http.StatusOK, events)
 }
 
@@ -346,12 +366,58 @@ func (h *Handler) handleNamespaceAudit(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
 
-	events, err := h.eng.Audit().Query(r.Context(), h.eng.DB().DB, engine.AuditFilter(tenantID, &ns.ID, nil, nil, nil, nil, limit, offset))
+	effLimit := limit
+	if effLimit <= 0 {
+		effLimit = 50
+	} else if effLimit > 100 {
+		effLimit = 100
+	}
+
+	events, err := h.eng.Audit().Query(r.Context(), h.eng.DB().DB, engine.AuditFilter(tenantID, &ns.ID, nil, nil, nil, nil, effLimit+1, offset))
 	if err != nil {
 		handleError(w, err)
 		return
 	}
+
+	hasMore := false
+	if len(events) > effLimit {
+		hasMore = true
+		events = events[:effLimit]
+	}
+
+	w.Header().Set("X-Has-More", strconv.FormatBool(hasMore))
+	w.Header().Set("X-Page-Limit", strconv.Itoa(effLimit))
 	writeJSON(w, http.StatusOK, events)
+}
+
+func (h *Handler) handleExportAudit(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	var nsSlug *string
+	if slug := r.URL.Query().Get("namespace"); slug != "" {
+		nsSlug = &slug
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	if err := h.eng.ExportAudit(r.Context(), tenantID, nsSlug, w); err != nil {
+		slog.Error("error exporting audit log", "tenant_id", tenantID, "error", err)
+	}
+}
+
+func (h *Handler) handleExportClaims(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.PathValue("id")
+	var nsSlug *string
+	if slug := r.URL.Query().Get("namespace"); slug != "" {
+		nsSlug = &slug
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	if err := h.eng.ExportClaims(r.Context(), tenantID, nsSlug, w); err != nil {
+		slog.Error("error exporting claims snapshot", "tenant_id", tenantID, "error", err)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

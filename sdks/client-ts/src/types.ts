@@ -47,7 +47,7 @@ export interface RememberResult {
   claim_id: string;
   version: number;
   created_at: string;
-  status: 'created' | 'updated' | 'conflict';
+  status: 'created' | 'updated' | 'conflict' | 'idempotent';
   conflict?: ConflictInfo;
 }
 
@@ -176,6 +176,7 @@ export interface GAMSClientOptions {
   apiKey: string;
   timeoutMs?: number;
   retryPolicy?: RetryPolicy;
+  signRequests?: boolean;
 }
 
 // MCP Adapter Types

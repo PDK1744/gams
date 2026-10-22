@@ -72,7 +72,7 @@ type RememberResponse struct {
 	ClaimID   string        `json:"claim_id"`
 	Version   int64         `json:"version"`
 	CreatedAt string        `json:"created_at"`
-	Status    string        `json:"status"` // "created" | "updated" | "conflict"
+	Status    string        `json:"status"` // "created" | "updated" | "conflict" | "idempotent"
 	Conflict  *ConflictInfo `json:"conflict,omitempty"`
 }
 
@@ -226,3 +226,32 @@ type TenantSummary struct {
 	WritesLast30Days     int64               `json:"writes_last_30_days"`
 	MostActiveNamespaces []NamespaceActivity `json:"most_active_namespaces"`
 }
+
+// Export formats (Phase 5, Decision Q7)
+
+// AuditExportRecord is a single line in a JSONL audit log export.
+type AuditExportRecord struct {
+	SchemaVersion string     `json:"schema_version"` // mandatory "1.0"
+	ExportedAt    string     `json:"exported_at"`
+	Event         AuditEvent `json:"event"`
+}
+
+// ClaimsExportHeader is the first record in a JSONL claims snapshot.
+type ClaimsExportHeader struct {
+	SchemaVersion string `json:"schema_version"` // mandatory "1.0"
+	RecordType    string `json:"record_type"`    // "header"
+	ExportedAt    string `json:"exported_at"`
+	TenantID      string `json:"tenant_id"`
+	NamespaceSlug string `json:"namespace_slug,omitempty"`
+	ClaimsCount   int64  `json:"claims_count"`
+}
+
+// ClaimsExportRecord represents a claim snapshot with all its versions and evidence.
+type ClaimsExportRecord struct {
+	SchemaVersion string         `json:"schema_version"` // mandatory "1.0"
+	RecordType    string         `json:"record_type"`    // "claim"
+	Claim         Claim          `json:"claim"`
+	Versions      []ClaimVersion `json:"versions"`
+	Evidence      []Evidence     `json:"evidence"`
+}
+
